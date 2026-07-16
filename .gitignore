@@ -1,0 +1,32 @@
+﻿# OS / IDE
+.DS_Store
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Dependencies / build
+node_modules/
+dist/
+build/
+out/
+*.log
+npm-debug.log*
+
+# Python (if used later)
+__pycache__/
+.venv/
+venv/
+*.pyc
+
+# Local data exports
+*.xlsx.bak
+tmp/
+temp/
