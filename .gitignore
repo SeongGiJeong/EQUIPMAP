@@ -1,4 +1,16 @@
-﻿# OS / IDE
+﻿__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+equipmap.db
+equipment_images/
+
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+# OS / IDE
 .DS_Store
 Thumbs.db
 Desktop.ini

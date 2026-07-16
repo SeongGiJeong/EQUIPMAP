@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EquipMap</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header class="toolbar">
+    <div class="brand">EQUIPMAP</div>
+    <div class="toolbar-group" aria-label="화면 배율">
+      <button id="zoom-out" title="축소">−</button>
+      <button id="zoom-reset" class="zoom-value" title="100%로 초기화">100%</button>
+      <button id="zoom-in" title="확대">＋</button>
+    </div>
+    <div id="status" class="status">불러오는 중...</div>
+  </header>
+
+  <main class="workspace">
+    <aside class="palette panel">
+      <h1>장비 목록</h1>
+      <div id="catalog"></div>
+      <p class="help">
+        모델을 누른 뒤 캔버스를 클릭하거나<br>
+        모델을 캔버스로 드래그하세요.
+      </p>
+    </aside>
+
+    <section id="canvas-wrap" class="canvas-wrap">
+      <canvas id="board" tabindex="0" aria-label="장비 배치 캔버스"></canvas>
+      <div id="place-banner" class="place-banner hidden"></div>
+      <div id="tooltip" class="tooltip hidden"></div>
+      <div id="context-menu" class="context-menu hidden">
+        <button data-action="move">이동</button>
+        <button data-action="lock">고정</button>
+        <div class="menu-separator"></div>
+        <button data-action="delete" class="danger">삭제</button>
+      </div>
+    </section>
+
+    <aside class="inspector panel">
+      <h1>장비 정보</h1>
+      <div id="inspector-content" class="inspector-content">
+        캔버스에서 장비를 선택하면 정보가 표시됩니다.
+      </div>
+    </aside>
+  </main>
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
