@@ -23,6 +23,7 @@ class RackSpec:
     # 월드 좌표 기준 기본 크기 (줌 100% = 픽셀)
     width: float
     height: float
+    is_half: bool = False
 
 
 def spec_from_record(record: EquipmentTypeRecord) -> RackSpec:
@@ -37,4 +38,5 @@ def spec_from_record(record: EquipmentTypeRecord) -> RackSpec:
         canvas_image_path=PROJECT_ROOT / record.canvas_image_path,
         width=record.width,
         height=record.height,
+        is_half=record.is_half,
     )

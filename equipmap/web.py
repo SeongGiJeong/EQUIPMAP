@@ -11,10 +11,20 @@ import webbrowser
 
 from flask import Flask, jsonify, render_template, request, send_from_directory
 
-from equipmap.database import DEFAULT_DB_PATH, EquipmentRecord, EquipmentRepository
+from equipmap.database import (
+    DEFAULT_DB_PATH,
+    EquipmentConnectionRecord,
+    EquipmentLogRecord,
+    EquipmentPortLinkRecord,
+    EquipmentRecord,
+    EquipmentRepository,
+    EquipmentTypeInterfaceRecord,
+    EquipmentTypeRecord,
+)
 from equipmap.image_search import (
     ImageSearchError,
     MAX_DOWNLOAD_BYTES,
+    google_images_search_url,
     save_equipment_image_content,
     search_and_save_equipment_image,
 )
@@ -33,6 +43,76 @@ def _equipment_payload(record: EquipmentRecord) -> dict:
         else ""
     )
     return payload
+
+
+def _equipment_type_payload(
+    record: EquipmentTypeRecord,
+    interfaces: list[EquipmentTypeInterfaceRecord] | None = None,
+) -> dict:
+    return {
+        **asdict(record),
+        "category_icon_url": (
+            f"/assets/{Path(record.category_icon_path).name}"
+        ),
+        "image_url": f"/assets/{Path(record.image_path).name}",
+        "interfaces": [
+            {
+                "interface_id": item.interface_id,
+                "group_name": item.group_name,
+                "interface_type": item.interface_type,
+                "port_count": item.port_count,
+                "sort_order": item.sort_order,
+            }
+            for item in (interfaces or [])
+        ],
+    }
+
+
+def _equipment_types_payload(
+    repository: EquipmentRepository,
+    records: list[EquipmentTypeRecord],
+) -> list[dict]:
+    interfaces_by_key = repository.list_type_interfaces(
+        [record.key for record in records]
+    )
+    return [
+        _equipment_type_payload(
+            record,
+            interfaces_by_key.get(record.key, []),
+        )
+        for record in records
+    ]
+
+
+def _equipment_log_payload(record: EquipmentLogRecord) -> dict:
+    return asdict(record)
+
+
+def _equipment_connection_payload(record: EquipmentConnectionRecord) -> dict:
+    return {
+        "connection_id": record.connection_id,
+        "interface_type": record.interface_type,
+        "port_index": record.port_index,
+        "connection_name": record.connection_name,
+    }
+
+
+def _equipment_port_link_payload(record: EquipmentPortLinkRecord) -> dict:
+    return {
+        "link_id": record.link_id,
+        "a_equipment_db_id": record.a_equipment_db_id,
+        "a_interface_type": record.a_interface_type,
+        "a_port_index": record.a_port_index,
+        "a_equipment_id": record.a_equipment_id,
+        "a_equipment_name": record.a_equipment_name,
+        "a_connection_name": record.a_connection_name,
+        "b_equipment_db_id": record.b_equipment_db_id,
+        "b_interface_type": record.b_interface_type,
+        "b_port_index": record.b_port_index,
+        "b_equipment_id": record.b_equipment_id,
+        "b_equipment_name": record.b_equipment_name,
+        "b_connection_name": record.b_connection_name,
+    }
 
 
 def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> Flask:
@@ -64,18 +144,102 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> Flask:
     @app.get("/api/equipment-types")
     def equipment_types():
         records = repository.list_equipment_types()
+        return jsonify(_equipment_types_payload(repository, records))
+
+    @app.put("/api/equipment-types/<spec_key>/interfaces")
+    def equipment_type_interfaces_update(spec_key: str):
+        values = request.get_json(silent=True) or {}
+        raw_interfaces = values.get("interfaces")
+        if not isinstance(raw_interfaces, list):
+            return jsonify({"error": "인터페이스 목록이 올바르지 않습니다."}), 400
+        if not all(isinstance(item, dict) for item in raw_interfaces):
+            return jsonify({"error": "인터페이스 항목이 올바르지 않습니다."}), 400
+        try:
+            spec_keys, interfaces = repository.replace_type_interfaces(
+                spec_key,
+                raw_interfaces,
+            )
+        except (TypeError, ValueError) as error:
+            return jsonify({"error": str(error)}), 400
         return jsonify(
-            [
-                {
-                    **asdict(record),
-                    "category_icon_url": (
-                        f"/assets/{Path(record.category_icon_path).name}"
-                    ),
-                    "image_url": f"/assets/{Path(record.image_path).name}",
-                }
-                for record in records
-            ]
+            {
+                "spec_keys": spec_keys,
+                "interfaces": [
+                    {
+                        "interface_id": item.interface_id,
+                        "group_name": item.group_name,
+                        "interface_type": item.interface_type,
+                        "port_count": item.port_count,
+                        "sort_order": item.sort_order,
+                    }
+                    for item in interfaces
+                ],
+            }
         )
+
+    @app.post("/api/equipment-types")
+    def equipment_type_create():
+        values = request.get_json(silent=True) or {}
+        try:
+            record = repository.create_equipment_type(
+                category_name=str(values.get("category_name", "")),
+                name=str(values.get("name", "")),
+                id_prefix=str(values.get("id_prefix", "")),
+                ru=int(values.get("ru", 1)),
+                is_half=bool(values.get("is_half", False)),
+            )
+        except (TypeError, ValueError) as error:
+            return jsonify({"error": str(error)}), 400
+        return jsonify(_equipment_type_payload(record, [])), 201
+
+    @app.patch("/api/equipment-types/category")
+    def equipment_category_update():
+        values = request.get_json(silent=True) or {}
+        try:
+            records = repository.update_category_name(
+                category_key=str(values.get("category_key", "")).strip(),
+                category_name=str(values.get("category_name", "")),
+            )
+        except (TypeError, ValueError) as error:
+            return jsonify({"error": str(error)}), 400
+        return jsonify(_equipment_types_payload(repository, records))
+
+    @app.patch("/api/equipment-types/group")
+    def equipment_type_group_update():
+        values = request.get_json(silent=True) or {}
+        raw_keys = values.get("spec_keys") or []
+        if not isinstance(raw_keys, list):
+            return jsonify({"error": "장비 종류 목록이 올바르지 않습니다."}), 400
+        try:
+            raw_ru = values.get("ru")
+            raw_category = values.get("category_name")
+            raw_half = values.get("is_half")
+            records = repository.update_equipment_type_group(
+                spec_keys=[str(key) for key in raw_keys],
+                name=str(values.get("name", "")),
+                category_name=(
+                    str(raw_category) if raw_category is not None else None
+                ),
+                ru=int(raw_ru) if raw_ru is not None else None,
+                is_half=bool(raw_half) if raw_half is not None else None,
+            )
+        except (TypeError, ValueError) as error:
+            return jsonify({"error": str(error)}), 400
+        return jsonify(_equipment_types_payload(repository, records))
+
+    @app.delete("/api/equipment-types/group")
+    def equipment_type_group_delete():
+        values = request.get_json(silent=True) or {}
+        raw_keys = values.get("spec_keys") or []
+        if not isinstance(raw_keys, list):
+            return jsonify({"error": "장비 종류 목록이 올바르지 않습니다."}), 400
+        try:
+            deleted = repository.delete_equipment_types(
+                spec_keys=[str(key) for key in raw_keys],
+            )
+        except (TypeError, ValueError) as error:
+            return jsonify({"error": str(error)}), 400
+        return jsonify({"deleted": deleted})
 
     @app.get("/api/equipment")
     def equipment_list():
@@ -130,28 +294,19 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> Flask:
             record.db_id: record
             for record in repository.list_all()
         }
-        created_ids: list[int] = []
+        created_records: list[EquipmentRecord] = []
         for db_id in db_ids:
             source = by_id.get(db_id)
             if source is None:
                 continue
-            created = repository.create(
-                spec_key=source.spec_key,
-                equipment_name=source.equipment_name,
-                world_x=source.world_x + offset_x,
-                world_y=source.world_y + offset_y,
-                layout_width=source.layout_width,
-                layout_height=source.layout_height,
-                locked=source.locked,
-            )
-            repository.update_details(
-                created.db_id,
-                equipment_name=source.equipment_name,
-                equipment_vendor=source.equipment_vendor,
-                equipment_model=source.equipment_model,
-                asset_number=source.asset_number,
-                serial_number=source.serial_number,
-            )
+            try:
+                created = repository.clone_equipment(
+                    source.db_id,
+                    offset_x=offset_x,
+                    offset_y=offset_y,
+                )
+            except (TypeError, ValueError) as error:
+                return jsonify({"error": str(error)}), 400
             if source.photo_path:
                 source_photo = (
                     EQUIPMENT_IMAGE_DIR / Path(source.photo_path).name
@@ -169,20 +324,17 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> Flask:
                         photo_source_url=source.photo_source_url,
                         photo_query=source.photo_query,
                     )
-            created_ids.append(created.db_id)
+                    created = next(
+                        record
+                        for record in repository.list_all()
+                        if record.db_id == created.db_id
+                    )
+            created_records.append(created)
 
-        if not created_ids:
+        if not created_records:
             return jsonify({"error": "복사할 장비를 찾을 수 없습니다."}), 404
-        created_by_id = {
-            record.db_id: record
-            for record in repository.list_all()
-            if record.db_id in created_ids
-        }
         return jsonify(
-            [
-                _equipment_payload(created_by_id[db_id])
-                for db_id in created_ids
-            ]
+            [_equipment_payload(record) for record in created_records]
         ), 201
 
     @app.patch("/api/equipment/<int:db_id>")
@@ -286,7 +438,12 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> Flask:
                 target_directory=EQUIPMENT_IMAGE_DIR,
             )
         except ImageSearchError as error:
-            return jsonify({"error": str(error)}), 404
+            return jsonify(
+                {
+                    "error": str(error),
+                    "google_images_url": google_images_search_url(photo_query),
+                }
+            ), 404
 
         repository.update_photo(
             db_id,
@@ -303,8 +460,47 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> Flask:
             {
                 **_equipment_payload(updated),
                 "photo_title": saved.title,
+                "photo_source_label": saved.source_label,
             }
         )
+
+    @app.post("/api/equipment/<int:db_id>/clear-photo")
+    @app.delete("/api/equipment/<int:db_id>/photo")
+    def equipment_clear_photo(db_id: int):
+        current = next(
+            (
+                record
+                for record in repository.list_all()
+                if record.db_id == db_id
+            ),
+            None,
+        )
+        if current is None:
+            return jsonify({"error": "장비를 찾을 수 없습니다."}), 404
+        if current.photo_path:
+            photo_file = EQUIPMENT_IMAGE_DIR / Path(current.photo_path).name
+            if photo_file.is_file():
+                try:
+                    photo_file.unlink()
+                except OSError:
+                    pass
+        repository.update_photo(
+            db_id,
+            photo_path="",
+            photo_source_url="",
+            photo_query="",
+        )
+        updated = next(
+            (
+                record
+                for record in repository.list_all()
+                if record.db_id == db_id
+            ),
+            None,
+        )
+        if updated is None:
+            return jsonify({"error": "장비를 찾을 수 없습니다."}), 404
+        return jsonify(_equipment_payload(updated))
 
     @app.post("/api/equipment/<int:db_id>/upload-image")
     def equipment_upload_image(db_id: int):
@@ -347,6 +543,155 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> Flask:
     @app.delete("/api/equipment/<int:db_id>")
     def equipment_delete(db_id: int):
         repository.delete(db_id)
+        return ("", 204)
+
+    @app.get("/api/equipment/<int:db_id>/connections")
+    def equipment_connections(db_id: int):
+        current = next(
+            (
+                record
+                for record in repository.list_all()
+                if record.db_id == db_id
+            ),
+            None,
+        )
+        if current is None:
+            return jsonify({"error": "장비를 찾을 수 없습니다."}), 404
+        return jsonify(
+            [
+                _equipment_connection_payload(record)
+                for record in repository.list_connections(db_id)
+            ]
+        )
+
+    @app.put("/api/equipment/<int:db_id>/connections")
+    def equipment_connections_update(db_id: int):
+        values = request.get_json(silent=True) or {}
+        raw_names = values.get("connection_names")
+        if not isinstance(raw_names, list):
+            return jsonify({"error": "연결 이름 목록이 올바르지 않습니다."}), 400
+        try:
+            records = repository.replace_connections(
+                db_id,
+                interface_type=str(values.get("interface_type", "")),
+                connection_names=[str(name) for name in raw_names],
+            )
+        except (TypeError, ValueError) as error:
+            return jsonify({"error": str(error)}), 400
+        return jsonify(
+            [_equipment_connection_payload(record) for record in records]
+        )
+
+    @app.get("/api/port-links")
+    def all_port_links():
+        return jsonify(
+            [
+                _equipment_port_link_payload(record)
+                for record in repository.list_port_links()
+            ]
+        )
+
+    @app.get("/api/equipment/<int:db_id>/port-links")
+    def equipment_port_links(db_id: int):
+        current = next(
+            (
+                record
+                for record in repository.list_all()
+                if record.db_id == db_id
+            ),
+            None,
+        )
+        if current is None:
+            return jsonify({"error": "장비를 찾을 수 없습니다."}), 404
+        return jsonify(
+            [
+                _equipment_port_link_payload(record)
+                for record in repository.list_port_links(db_id)
+            ]
+        )
+
+    @app.post("/api/equipment/port-links")
+    def equipment_port_link_create():
+        values = request.get_json(silent=True) or {}
+        source = values.get("from") or {}
+        target = values.get("to") or {}
+        if not isinstance(source, dict) or not isinstance(target, dict):
+            return jsonify({"error": "연결 정보가 올바르지 않습니다."}), 400
+        try:
+            record = repository.upsert_port_link(
+                from_equipment_db_id=int(source.get("db_id")),
+                from_interface_type=str(source.get("interface_type", "")),
+                from_port_index=int(source.get("port_index")),
+                to_equipment_db_id=int(target.get("db_id")),
+                to_interface_type=str(target.get("interface_type", "")),
+                to_port_index=int(target.get("port_index")),
+            )
+        except (TypeError, ValueError) as error:
+            return jsonify({"error": str(error)}), 400
+        return jsonify(_equipment_port_link_payload(record)), 201
+
+    @app.delete("/api/equipment/port-links/<int:link_id>")
+    def equipment_port_link_delete(link_id: int):
+        try:
+            repository.delete_port_link(link_id)
+        except ValueError as error:
+            return jsonify({"error": str(error)}), 404
+        return ("", 204)
+
+    @app.get("/api/equipment/<int:db_id>/logs")
+    def equipment_logs(db_id: int):
+        current = next(
+            (
+                record
+                for record in repository.list_all()
+                if record.db_id == db_id
+            ),
+            None,
+        )
+        if current is None:
+            return jsonify({"error": "장비를 찾을 수 없습니다."}), 404
+        return jsonify(
+            [
+                _equipment_log_payload(record)
+                for record in repository.list_logs(db_id)
+            ]
+        )
+
+    @app.post("/api/equipment/<int:db_id>/logs")
+    def equipment_log_create(db_id: int):
+        values = request.get_json(silent=True) or {}
+        try:
+            record = repository.create_log(
+                db_id,
+                log_date=str(values.get("log_date", "")),
+                category=str(values.get("category", "")),
+                action=str(values.get("action", "")),
+            )
+        except (TypeError, ValueError) as error:
+            return jsonify({"error": str(error)}), 400
+        return jsonify(_equipment_log_payload(record)), 201
+
+    @app.patch("/api/equipment/<int:db_id>/logs/<int:log_id>")
+    def equipment_log_update(db_id: int, log_id: int):
+        values = request.get_json(silent=True) or {}
+        try:
+            record = repository.update_log(
+                db_id,
+                log_id,
+                log_date=str(values.get("log_date", "")),
+                category=str(values.get("category", "")),
+                action=str(values.get("action", "")),
+            )
+        except (TypeError, ValueError) as error:
+            return jsonify({"error": str(error)}), 400
+        return jsonify(_equipment_log_payload(record))
+
+    @app.delete("/api/equipment/<int:db_id>/logs/<int:log_id>")
+    def equipment_log_delete(db_id: int, log_id: int):
+        try:
+            repository.delete_log(db_id, log_id)
+        except ValueError as error:
+            return jsonify({"error": str(error)}), 404
         return ("", 204)
 
     @app.post("/api/equipment/restore")

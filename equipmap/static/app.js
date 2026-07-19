@@ -8,6 +8,36 @@ const inspector = document.getElementById("inspector-content");
 const placeBanner = document.getElementById("place-banner");
 const tooltip = document.getElementById("tooltip");
 const contextMenu = document.getElementById("context-menu");
+const portMenu = document.getElementById("port-menu");
+const cableModeButton = document.getElementById("cable-mode");
+const editCatalogButton = document.getElementById("edit-catalog");
+const catalogEditorDialog = document.getElementById("catalog-editor-dialog");
+const catalogEditorList = document.getElementById("catalog-editor-list");
+const catalogEditorError = document.getElementById("catalog-editor-error");
+const addEquipmentTypeButton = document.getElementById("add-equipment-type");
+const closeCatalogEditorButton = document.getElementById(
+  "close-catalog-editor",
+);
+const equipmentTypeDialog = document.getElementById("equipment-type-dialog");
+const equipmentTypeForm = document.getElementById("equipment-type-form");
+const equipmentTypeDialogTitle = document.getElementById(
+  "equipment-type-dialog-title",
+);
+const newTypeCategory = document.getElementById("new-type-category");
+const equipmentCategoryOptions = document.getElementById(
+  "equipment-category-options",
+);
+const newTypeName = document.getElementById("new-type-name");
+const newTypePrefix = document.getElementById("new-type-prefix");
+const newTypePrefixField = document.getElementById("new-type-prefix-field");
+const newTypePrefixHelp = document.getElementById("new-type-prefix-help");
+const newTypeRu = document.getElementById("new-type-ru");
+const newTypeRuField = document.getElementById("new-type-ru-field");
+const newTypeRuHelp = document.getElementById("new-type-ru-help");
+const newTypeHalf = document.getElementById("new-type-half");
+const newTypeHalfField = document.getElementById("new-type-half-field");
+const equipmentTypeError = document.getElementById("equipment-type-error");
+const saveEquipmentTypeButton = document.getElementById("save-equipment-type");
 
 const MIN_ZOOM = 0.25;
 const MAX_ZOOM = 8;
@@ -23,13 +53,20 @@ const state = {
   offsetY: 0,
   placeSpec: null,
   expandedCategory: null,
-  ruSelections: { rack: 46, blank_panel: 1 },
   clipboardIds: [],
   undoStack: [],
   drag: null,
   pan: null,
   marquee: null,
   inspectorEditing: false,
+  connectionEditing: false,
+  expandedInterfaceType: null,
+  connectionNamesByType: {},
+  linkDraft: null,
+  typeEditor: null,
+  cableMode: false,
+  links: [],
+  portMenuItemId: null,
 };
 
 function escapeHtml(value) {
@@ -63,6 +100,26 @@ function specFor(item) {
 
 function isRackKey(key) {
   return /^rack_\d+ru$/.test(key);
+}
+
+function instanceRu(item, fallbackSpec = null) {
+  const spec = fallbackSpec || specFor(item);
+  if (!spec) return 1;
+  const typeRu = Math.max(1, Number(spec.ru) || 1);
+  const layoutHeight = Number(item.layout_height) || 0;
+  if (layoutHeight <= 0) return typeRu;
+  if (isRackKey(item.spec_key || spec.key)) {
+    const unit = Number(spec.height) / (typeRu + 4);
+    if (unit > 0) {
+      return Math.max(1, Math.round(layoutHeight / unit - 4));
+    }
+    return typeRu;
+  }
+  const unit = Number(spec.height) / typeRu;
+  if (unit > 0) {
+    return Math.max(1, Math.round(layoutHeight / unit));
+  }
+  return typeRu;
 }
 
 function selectedItems() {
@@ -194,7 +251,7 @@ function drawRack(item, box) {
   ctx.fillRect(x0, y0, width, height);
   ctx.strokeRect(x0, y0, width, height);
 
-  const ruCount = Math.max(1, Number(specFor(item)?.ru) || 46);
+  const ruCount = Math.max(1, instanceRu(item));
   const structuralUnit = height / (ruCount + 4);
   const inset = Math.max(width * 0.018, 0.6 * state.zoom);
   const topHeight = structuralUnit * 2.25;
@@ -317,7 +374,7 @@ function drawBlankPanel(item, box) {
   ctx.strokeRect(x0, y0, width, height);
 
   ctx.fillStyle = "rgba(255, 255, 255, 0.65)";
-  const ru = Math.max(1, specFor(item)?.ru || 1);
+  const ru = Math.max(1, instanceRu(item));
   const unitHeight = height / ru;
   const margin = width * 0.09;
   const gap = width * 0.035;
@@ -529,7 +586,7 @@ function drawDrawer(_item, box) {
 
 function drawBroadcastDevice(item, box) {
   const { x0, y0, width, height } = box;
-  const ru = Math.max(1, Number(specFor(item)?.ru) || 1);
+  const ru = Math.max(1, instanceRu(item));
   const oneRuHeight = height / ru;
   const color = "#252a31";
   const lineWidth = Math.max(0.6, Math.min(3, state.zoom));
@@ -586,6 +643,7 @@ function drawEquipment() {
     else if (item.spec_key === "drawer_2ru") drawDrawer(item, box);
     else if (item.spec_key === "pdu_2ru") drawPdu(item, box);
     else if (item.spec_key.startsWith("blank_panel_")) drawBlankPanel(item, box);
+    else drawBroadcastDevice(item, box);
   }
 }
 
@@ -618,36 +676,130 @@ function drawMarquee() {
   ctx.restore();
 }
 
+function edgeAnchor(box, targetX, targetY) {
+  const cx = (box.x0 + box.x1) / 2;
+  const cy = (box.y0 + box.y1) / 2;
+  const dx = targetX - cx;
+  const dy = targetY - cy;
+  if (dx === 0 && dy === 0) return { x: cx, y: cy };
+  const hw = (box.x1 - box.x0) / 2;
+  const hh = (box.y1 - box.y0) / 2;
+  const scale = 1 / Math.max(Math.abs(dx) / hw || 0, Math.abs(dy) / hh || 0);
+  return { x: cx + dx * scale, y: cy + dy * scale };
+}
+
+function drawCables() {
+  if (!state.links.length) return;
+  const byId = new Map(state.items.map((item) => [item.db_id, item]));
+  const pairOffset = new Map();
+  for (const link of state.links) {
+    const key = [link.a_equipment_db_id, link.b_equipment_db_id]
+      .sort((a, b) => a - b)
+      .join("-");
+    pairOffset.set(key, (pairOffset.get(key) || 0) + 1);
+  }
+  const pairSeen = new Map();
+  const gap = Math.max(5, 8 * state.zoom);
+  ctx.save();
+  ctx.lineWidth = Math.max(1.4, state.zoom * 1.6);
+  ctx.lineCap = "round";
+  for (const link of state.links) {
+    const a = byId.get(link.a_equipment_db_id);
+    const b = byId.get(link.b_equipment_db_id);
+    if (!a || !b) continue;
+    const boxA = itemBox(a);
+    const boxB = itemBox(b);
+    const ca = { x: (boxA.x0 + boxA.x1) / 2, y: (boxA.y0 + boxA.y1) / 2 };
+    const cb = { x: (boxB.x0 + boxB.x1) / 2, y: (boxB.y0 + boxB.y1) / 2 };
+    const key = [link.a_equipment_db_id, link.b_equipment_db_id]
+      .sort((n, m) => n - m)
+      .join("-");
+    const total = pairOffset.get(key) || 1;
+    const seen = pairSeen.get(key) || 0;
+    pairSeen.set(key, seen + 1);
+    let ox = 0;
+    let oy = 0;
+    if (total > 1) {
+      const len = Math.hypot(cb.x - ca.x, cb.y - ca.y) || 1;
+      const shift = (seen - (total - 1) / 2) * gap;
+      ox = (-(cb.y - ca.y) / len) * shift;
+      oy = ((cb.x - ca.x) / len) * shift;
+    }
+    const pa = edgeAnchor(boxA, cb.x + ox, cb.y + oy);
+    const pb = edgeAnchor(boxB, ca.x + ox, ca.y + oy);
+    pa.x += ox; pa.y += oy;
+    pb.x += ox; pb.y += oy;
+    ctx.strokeStyle = "#f59e0b";
+    ctx.beginPath();
+    ctx.moveTo(pa.x, pa.y);
+    ctx.lineTo(pb.x, pb.y);
+    ctx.stroke();
+    const dot = Math.max(2, state.zoom * 2.2);
+    ctx.fillStyle = "#d97706";
+    for (const point of [pa, pb]) {
+      ctx.beginPath();
+      ctx.arc(point.x, point.y, dot, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+  ctx.restore();
+}
+
 function draw() {
   drawGrid();
   drawEquipment();
+  drawCables();
   drawSelection();
   drawMarquee();
   zoomEl.textContent = `${Math.round(state.zoom * 100)}%`;
 }
 
-function renderCatalog() {
+function categoryOrderValue(key) {
+  const categoryOrder = {
+    rack: 0,
+    broadcast_equipment: 1,
+    custom_equipment: 2,
+  };
+  return categoryOrder[key] ?? 999;
+}
+
+function sortedCategories() {
   const categories = new Map();
   for (const spec of state.types) {
-    if (!categories.has(spec.category_key)) categories.set(spec.category_key, []);
+    if (!categories.has(spec.category_key)) {
+      categories.set(spec.category_key, []);
+    }
     categories.get(spec.category_key).push(spec);
   }
-
-  catalog.innerHTML = "";
-  const categoryOrder = { rack: 0, broadcast_equipment: 1 };
-  const categoryEntries = [...categories.entries()].sort(
-    ([left], [right]) =>
-      (categoryOrder[left] ?? 999) - (categoryOrder[right] ?? 999),
+  return [...categories.entries()].sort(
+    ([left], [right]) => categoryOrderValue(left) - categoryOrderValue(right),
   );
-  for (const [key, specs] of categoryEntries) {
+}
+
+function groupedVariants(specs) {
+  const grouped = new Map();
+  for (const spec of specs) {
+    const groupKey = isRackKey(spec.key)
+      ? "rack"
+      : spec.key.startsWith("blank_panel_")
+        ? "blank_panel"
+        : `${spec.id_prefix || spec.name}`;
+    if (!grouped.has(groupKey)) grouped.set(groupKey, []);
+    grouped.get(groupKey).push(spec);
+  }
+  return [...grouped.values()].map((variants) =>
+    variants.sort((left, right) => Number(left.ru) - Number(right.ru)),
+  );
+}
+
+function renderCatalog() {
+  catalog.innerHTML = "";
+  for (const [key, specs] of sortedCategories()) {
     const first = specs[0];
     const categoryButton = document.createElement("button");
     categoryButton.className = "category-card";
     if (state.expandedCategory === key) categoryButton.classList.add("active");
     categoryButton.innerHTML = `
-      ${key === "rack"
-        ? ""
-        : `<img src="${escapeHtml(first.category_icon_url)}" alt="">`}
       <strong>${escapeHtml(first.category_name)}</strong>
     `;
     categoryButton.addEventListener("click", () => {
@@ -661,11 +813,12 @@ function renderCatalog() {
     list.className = "model-list";
     list.innerHTML = "<h2>장비 목록 선택</h2>";
 
-    const addSpecButton = (spec, parent, nested = false) => {
+    for (const variants of groupedVariants(specs)) {
+      const spec = isRackKey(variants[0].key)
+        ? variants[variants.length - 1]
+        : variants[0];
       const button = document.createElement("button");
-      button.className = nested
-        ? "model-button sub-model-button"
-        : "model-button";
+      button.className = "model-button";
       if (state.placeSpec?.key === spec.key) button.classList.add("selected");
       button.textContent = spec.name;
       button.draggable = true;
@@ -674,109 +827,278 @@ function renderCatalog() {
         event.dataTransfer.setData("text/equipmap-spec", spec.key);
         event.dataTransfer.effectAllowed = "copy";
       });
-      parent.appendChild(button);
-    };
-
-    const addRuSelector = (
-      label,
-      variants,
-      selectionKey,
-      minRu = 1,
-      maxRu = 10,
-    ) => {
-      const selector = document.createElement("div");
-      selector.className = "ru-size-selector";
-      const selectButton = document.createElement("button");
-      selectButton.className = "model-group-button";
-      if (variants.some((variant) => state.placeSpec?.key === variant.key)) {
-        selectButton.classList.add("active");
-      }
-      selectButton.textContent = label;
-      const ruInput = document.createElement("input");
-      ruInput.className = "ru-size-input";
-      ruInput.type = "number";
-      ruInput.min = String(minRu);
-      ruInput.max = String(maxRu);
-      ruInput.step = "1";
-      ruInput.value = String(state.ruSelections[selectionKey] || minRu);
-      ruInput.setAttribute("aria-label", `${label} RU 크기`);
-      const suffix = document.createElement("span");
-      suffix.className = "ru-size-suffix";
-      suffix.textContent = "RU";
-      const selectedVariant = () => {
-        const ru = Math.max(
-          minRu,
-          Math.min(
-            maxRu,
-            Math.round(Number(ruInput.value) || minRu),
-          ),
-        );
-        state.ruSelections[selectionKey] = ru;
-        ruInput.value = String(ru);
-        return variants.find((variant) => Number(variant.ru) === ru);
-      };
-      const choose = () => {
-        const selected = selectedVariant();
-        if (selected) startPlacement(selected);
-      };
-      selectButton.addEventListener("click", choose);
-      selectButton.draggable = true;
-      selectButton.addEventListener("dragstart", (event) => {
-        const selected = selectedVariant();
-        if (!selected) return;
-        event.dataTransfer.setData("text/equipmap-spec", selected.key);
-        event.dataTransfer.effectAllowed = "copy";
-      });
-      ruInput.addEventListener("change", selectedVariant);
-      ruInput.addEventListener("keydown", (event) => {
-        if (event.key === "Enter") {
-          event.preventDefault();
-          choose();
-        }
-      });
-      selector.append(selectButton, ruInput, suffix);
-      list.appendChild(selector);
-    };
-
-    if (key === "broadcast_equipment") {
-      const grouped = new Map();
-      for (const spec of specs) {
-        if (!grouped.has(spec.name)) grouped.set(spec.name, []);
-        grouped.get(spec.name).push(spec);
-      }
-      for (const [name, variants] of grouped) {
-        addRuSelector(name, variants, `broadcast:${name}`);
-      }
-      catalog.appendChild(list);
-      continue;
-    }
-
-    const rackSpecs = specs.filter((spec) => isRackKey(spec.key));
-    const blankSpecs = specs.filter(
-      (spec) => spec.key.startsWith("blank_panel_"),
-    );
-    let rackGroupAdded = false;
-    let blankGroupAdded = false;
-    for (const spec of specs) {
-      if (isRackKey(spec.key)) {
-        if (rackGroupAdded) continue;
-        rackGroupAdded = true;
-        addRuSelector("RACK", rackSpecs, "rack", 23, 46);
-        continue;
-      }
-      if (spec.key.startsWith("blank_panel_")) {
-        if (blankGroupAdded) continue;
-        blankGroupAdded = true;
-        addRuSelector("BLANK PANEL", blankSpecs, "blank_panel");
-        continue;
-      }
-      addSpecButton(spec, list);
+      list.appendChild(button);
     }
     catalog.appendChild(list);
   }
 }
 
+function suggestedIdPrefix(name) {
+  return String(name || "")
+    .normalize("NFKD")
+    .toUpperCase()
+    .replaceAll(/[^A-Z0-9]+/g, "_")
+    .replaceAll(/^_+|_+$/g, "")
+    .replaceAll(/^[^A-Z]+/g, "")
+    .slice(0, 20);
+}
+
+function replaceEquipmentTypes(records) {
+  const updates = new Map(records.map((record) => [record.key, record]));
+  state.types = state.types.map((spec) => updates.get(spec.key) || spec);
+  for (const record of records) state.typeByKey.set(record.key, record);
+  if (state.placeSpec && updates.has(state.placeSpec.key)) {
+    state.placeSpec = updates.get(state.placeSpec.key);
+  }
+}
+
+function removeEquipmentTypes(keys) {
+  const removed = new Set(keys);
+  state.types = state.types.filter((spec) => !removed.has(spec.key));
+  for (const key of removed) state.typeByKey.delete(key);
+  if (state.placeSpec && removed.has(state.placeSpec.key)) {
+    cancelPlacement();
+  }
+}
+
+function refreshCategoryOptions() {
+  const categoryNames = [
+    ...new Set(state.types.map((spec) => spec.category_name)),
+  ];
+  equipmentCategoryOptions.innerHTML = categoryNames
+    .map((name) => `<option value="${escapeHtml(name)}"></option>`)
+    .join("");
+}
+
+function openCatalogEditor() {
+  catalogEditorError.textContent = "";
+  renderCatalogEditor();
+  catalogEditorDialog.showModal();
+}
+
+function renderCatalogEditor() {
+  catalogEditorList.innerHTML = "";
+  for (const [categoryKey, specs] of sortedCategories()) {
+    const section = document.createElement("section");
+    section.className = "catalog-editor-section";
+    const header = document.createElement("div");
+    header.className = "catalog-editor-category";
+    const title = document.createElement("strong");
+    title.textContent = specs[0].category_name;
+    const renameButton = document.createElement("button");
+    renameButton.type = "button";
+    renameButton.textContent = "대그룹 이름";
+    renameButton.addEventListener("click", () => {
+      editCategoryName(categoryKey, specs[0]);
+    });
+    header.append(title, renameButton);
+    section.appendChild(header);
+
+    for (const variants of groupedVariants(specs)) {
+      const row = document.createElement("div");
+      row.className = "catalog-editor-row";
+      const info = document.createElement("div");
+      info.className = "catalog-editor-info";
+      const name = document.createElement("strong");
+      name.textContent = variants[0].name;
+      const meta = document.createElement("span");
+      const preferred = isRackKey(variants[0].key)
+        ? variants[variants.length - 1]
+        : variants[0];
+      meta.textContent = `${preferred.ru} RU${
+        preferred.is_half ? " · Half" : ""
+      } · ${preferred.id_prefix}`;
+      info.append(name, meta);
+
+      const actions = document.createElement("div");
+      actions.className = "catalog-editor-actions";
+      const editButton = document.createElement("button");
+      editButton.type = "button";
+      editButton.textContent = "수정";
+      editButton.addEventListener("click", () => {
+        openEquipmentTypeDialog(variants);
+      });
+      const deleteButton = document.createElement("button");
+      deleteButton.type = "button";
+      deleteButton.className = "danger";
+      deleteButton.textContent = "삭제";
+      deleteButton.addEventListener("click", () => {
+        deleteEquipmentGroup(variants);
+      });
+      actions.append(editButton, deleteButton);
+      row.append(info, actions);
+      section.appendChild(row);
+    }
+    catalogEditorList.appendChild(section);
+  }
+  if (!state.types.length) {
+    catalogEditorList.innerHTML =
+      '<p class="field-help">등록된 장비가 없습니다. 장비를 추가해주세요.</p>';
+  }
+}
+
+function openEquipmentTypeDialog(variants = null) {
+  equipmentTypeForm.reset();
+  equipmentTypeError.textContent = "";
+  refreshCategoryOptions();
+  state.typeEditor = variants
+    ? { specKeys: variants.map((variant) => variant.key) }
+    : null;
+
+  if (variants) {
+    const first = variants[0];
+    const preferred = isRackKey(first.key)
+      ? variants[variants.length - 1]
+      : first;
+    equipmentTypeDialogTitle.textContent = "장비 종류 수정";
+    saveEquipmentTypeButton.textContent = "저장";
+    newTypeCategory.value = first.category_name;
+    newTypeCategory.disabled = false;
+    newTypeName.value = first.name;
+    newTypePrefixField.hidden = true;
+    newTypePrefixHelp.hidden = true;
+    newTypePrefix.required = false;
+    newTypeRuField.hidden = false;
+    newTypeRu.disabled = false;
+    newTypeRuHelp.classList.add("hidden");
+    newTypeRu.value = String(preferred.ru);
+    newTypeRu.min = "1";
+    newTypeRu.max = "46";
+    const canBeHalf = !isRackKey(first.key);
+    newTypeHalfField.hidden = !canBeHalf;
+    newTypeHalf.disabled = !canBeHalf;
+    newTypeHalf.checked = Boolean(preferred.is_half);
+  } else {
+    equipmentTypeDialogTitle.textContent = "장비 종류 추가";
+    saveEquipmentTypeButton.textContent = "추가";
+    newTypeCategory.disabled = false;
+    newTypePrefixField.hidden = false;
+    newTypePrefixHelp.hidden = false;
+    newTypePrefix.required = true;
+    newTypePrefix.dataset.manual = "false";
+    newTypeRuField.hidden = false;
+    newTypeRu.disabled = false;
+    newTypeRuHelp.classList.add("hidden");
+    newTypeRu.min = "1";
+    newTypeRu.max = "46";
+    newTypeHalfField.hidden = false;
+    newTypeHalf.disabled = false;
+    newTypeHalf.checked = false;
+  }
+  equipmentTypeDialog.showModal();
+  (variants ? newTypeName : newTypeCategory).focus();
+}
+
+async function saveEquipmentType(event) {
+  event.preventDefault();
+  equipmentTypeError.textContent = "";
+  saveEquipmentTypeButton.disabled = true;
+  try {
+    if (state.typeEditor) {
+      const oldKeys = state.typeEditor.specKeys;
+      const payload = {
+        spec_keys: oldKeys,
+        name: newTypeName.value.trim(),
+        category_name: newTypeCategory.value.trim(),
+        ru: Number(newTypeRu.value),
+        is_half: Boolean(newTypeHalf.checked),
+      };
+      const records = await api("/api/equipment-types/group", {
+        method: "PATCH",
+        body: JSON.stringify(payload),
+      });
+      const keptKeys = new Set(records.map((record) => record.key));
+      const previousPlaceKey = state.placeSpec?.key || null;
+      removeEquipmentTypes(oldKeys.filter((key) => !keptKeys.has(key)));
+      replaceEquipmentTypes(records);
+      const survivor =
+        records.find((record) => record.key === previousPlaceKey) ||
+        records[records.length - 1] ||
+        records[0];
+      if (survivor && previousPlaceKey && oldKeys.includes(previousPlaceKey)) {
+        state.placeSpec = survivor;
+      }
+      // 배치된 장비의 이름/크기는 목록 수정과 무관하게 유지한다.
+      state.expandedCategory =
+        survivor?.category_key || state.expandedCategory;
+      setStatus(`${survivor?.name || "장비"} 종류를 수정했습니다.`);
+    } else {
+      const spec = await api("/api/equipment-types", {
+        method: "POST",
+        body: JSON.stringify({
+          category_name: newTypeCategory.value.trim(),
+          name: newTypeName.value.trim(),
+          id_prefix: newTypePrefix.value.trim().toUpperCase(),
+          ru: Number(newTypeRu.value),
+          is_half: Boolean(newTypeHalf.checked),
+        }),
+      });
+      state.types.push(spec);
+      state.typeByKey.set(spec.key, spec);
+      state.expandedCategory = spec.category_key;
+      setStatus(`${spec.name} 장비 종류가 추가되었습니다.`);
+    }
+    equipmentTypeDialog.close();
+    renderCatalog();
+    if (catalogEditorDialog.open) renderCatalogEditor();
+    draw();
+  } catch (error) {
+    equipmentTypeError.textContent = error.message;
+  } finally {
+    saveEquipmentTypeButton.disabled = false;
+  }
+}
+
+async function editCategoryName(categoryKey, firstSpec) {
+  const categoryName = window.prompt(
+    "대그룹 이름을 입력하세요.",
+    firstSpec.category_name,
+  );
+  if (categoryName === null || !categoryName.trim()) return;
+  catalogEditorError.textContent = "";
+  try {
+    const records = await api("/api/equipment-types/category", {
+      method: "PATCH",
+      body: JSON.stringify({
+        category_key: categoryKey,
+        category_name: categoryName.trim(),
+      }),
+    });
+    replaceEquipmentTypes(records);
+    renderCatalog();
+    if (catalogEditorDialog.open) renderCatalogEditor();
+    setStatus(`${categoryName.trim()} 대그룹 이름을 저장했습니다.`);
+  } catch (error) {
+    if (catalogEditorDialog.open) {
+      catalogEditorError.textContent = error.message;
+    } else {
+      alert(error.message);
+    }
+  }
+}
+
+async function deleteEquipmentGroup(variants) {
+  const name = variants[0].name;
+  if (!window.confirm(`"${name}" 장비 종류를 목록에서 삭제할까요?`)) return;
+  catalogEditorError.textContent = "";
+  try {
+    const result = await api("/api/equipment-types/group", {
+      method: "DELETE",
+      body: JSON.stringify({
+        spec_keys: variants.map((variant) => variant.key),
+      }),
+    });
+    removeEquipmentTypes(result.deleted || []);
+    renderCatalog();
+    renderCatalogEditor();
+    setStatus(`${name} 장비 종류를 삭제했습니다.`);
+  } catch (error) {
+    catalogEditorError.textContent = error.message;
+  }
+}
+
 function startPlacement(spec) {
+  state.linkDraft = null;
   state.placeSpec = spec;
   clearSelection();
   board.classList.add("placing");
@@ -790,7 +1112,11 @@ function cancelPlacement() {
   if (!state.placeSpec) return false;
   state.placeSpec = null;
   board.classList.remove("placing");
-  placeBanner.classList.add("hidden");
+  if (state.linkDraft) {
+    updateLinkDraftBanner();
+  } else {
+    placeBanner.classList.add("hidden");
+  }
   renderCatalog();
   setStatus("준비됨");
   return true;
@@ -961,7 +1287,7 @@ function isRackMountedSpec(spec) {
 }
 
 function rackMetrics(rack) {
-  const ruCount = Math.max(1, Number(specFor(rack)?.ru) || 46);
+  const ruCount = Math.max(1, instanceRu(rack));
   const structuralUnit = rack.layout_height / (ruCount + 4);
   const top =
     rack.world_y - rack.layout_height / 2 + structuralUnit * 2.25;
@@ -981,19 +1307,22 @@ function snapRackMountedGeometry(spec, x, y, width, height) {
   if (!rack) return { x, y, width, height, rack: null };
 
   const metrics = rackMetrics(rack);
+  const inferredRu = Math.max(
+    1,
+    Math.round(Number(height) / Math.max(metrics.unitHeight, 0.0001)),
+  );
   const ru = Math.max(
     1,
-    Math.min(metrics.ruCount, Math.round(Number(spec.ru) || 1)),
+    Math.min(
+      metrics.ruCount,
+      Number(height) > 0 ? inferredRu : Math.round(Number(spec.ru) || 1),
+    ),
   );
-  let snappedWidth = width;
-  if (
-    spec.key.startsWith("blank_panel_") ||
-    spec.key.startsWith("broadcast_") ||
-    spec.key === "drawer_2ru" ||
-    spec.key === "pdu_2ru"
-  ) {
-    snappedWidth = rack.layout_width * (485 / 600);
-  }
+  const fullMountWidth = rack.layout_width * (485 / 600);
+  const treatAsHalf =
+    Boolean(spec.is_half) ||
+    (Number(width) > 0 && Number(width) < fullMountWidth * 0.7);
+  const snappedWidth = treatAsHalf ? fullMountWidth / 2 : fullMountWidth;
   const snappedHeight = metrics.unitHeight * ru;
   const firstUnit = Math.max(
     0,
@@ -1002,8 +1331,23 @@ function snapRackMountedGeometry(spec, x, y, width, height) {
       Math.round((y - metrics.top) / metrics.unitHeight - ru / 2),
     ),
   );
+  const mountLeft = rack.world_x - fullMountWidth / 2;
+  const mountRight = rack.world_x + fullMountWidth / 2;
+  let snappedX = rack.world_x;
+  if (treatAsHalf) {
+    const leftX = mountLeft + snappedWidth / 2;
+    const centerX = rack.world_x;
+    const rightX = mountRight - snappedWidth / 2;
+    const candidates = [
+      { x: leftX, distance: Math.abs(x - leftX) },
+      { x: centerX, distance: Math.abs(x - centerX) },
+      { x: rightX, distance: Math.abs(x - rightX) },
+    ];
+    candidates.sort((left, right) => left.distance - right.distance);
+    snappedX = candidates[0].x;
+  }
   return {
-    x: rack.world_x,
+    x: snappedX,
     y: metrics.top + (firstUnit + ru / 2) * metrics.unitHeight,
     width: snappedWidth,
     height: snappedHeight,
@@ -1034,21 +1378,7 @@ function snapItemToRack(item) {
 }
 
 function normalizeRackSizes() {
-  for (const rack of state.items) {
-    if (!isRackKey(rack.spec_key)) continue;
-    const spec = specFor(rack);
-    if (!spec) continue;
-    const width = Number(spec.width);
-    const height = Number(spec.height);
-    if (
-      Math.abs(rack.layout_width - width) > 0.001 ||
-      Math.abs(rack.layout_height - height) > 0.001
-    ) {
-      rack.layout_width = width;
-      rack.layout_height = height;
-      saveItem(rack);
-    }
-  }
+  // 배치된 장비 크기는 인스턴스별로 유지한다. 목록 RU 변경과 동기화하지 않음.
 }
 
 function normalizeNearbyRackRows() {
@@ -1073,11 +1403,27 @@ function normalizeRackMountedItems() {
 function setSelection(ids) {
   state.selected = ids;
   state.inspectorEditing = false;
+  state.connectionEditing = false;
+  state.expandedInterfaceType = null;
+  state.connectionNamesByType = {};
   hideContextMenu();
   hideTooltip();
   renderInspector();
   draw();
   const items = selectedItems();
+  if (state.linkDraft) {
+    updateLinkDraftBanner();
+    if (items.length === 1 && items[0].db_id !== state.linkDraft.db_id) {
+      setStatus(
+        `연결 대상: ${items[0].equipment_id} — 연결할 포트를 클릭하세요.`,
+      );
+    } else if (items.length === 1) {
+      setStatus("같은 장비입니다. 다른 장비를 선택한 뒤 포트를 클릭하세요.");
+    } else {
+      setStatus("연결 대상 장비를 선택한 뒤 포트를 클릭하세요.");
+    }
+    return;
+  }
   if (!items.length) setStatus("준비됨");
   else if (items.length === 1) {
     setStatus(
@@ -1091,6 +1437,535 @@ function setSelection(ids) {
 
 function clearSelection() {
   setSelection(new Set());
+}
+
+function interfaceTotals(spec) {
+  const interfaces = Array.isArray(spec?.interfaces) ? [...spec.interfaces] : [];
+  const totals = new Map();
+  const order = [];
+  const sorted = interfaces.sort(
+    (a, b) => (a.sort_order - b.sort_order) || (a.interface_id - b.interface_id),
+  );
+  for (const item of sorted) {
+    const type = item.interface_type || "기타";
+    if (!totals.has(type)) {
+      totals.set(type, 0);
+      order.push(type);
+    }
+    totals.set(type, totals.get(type) + (Number(item.port_count) || 0));
+  }
+  return order.map((type) => ({
+    interface_type: type,
+    port_count: totals.get(type),
+  }));
+}
+
+function portLinkFor(item, interfaceType, portIndex) {
+  const links = item?._portLinks || [];
+  return links.find((link) => (
+    (
+      link.a_equipment_db_id === item.db_id
+      && link.a_interface_type === interfaceType
+      && link.a_port_index === portIndex
+    ) || (
+      link.b_equipment_db_id === item.db_id
+      && link.b_interface_type === interfaceType
+      && link.b_port_index === portIndex
+    )
+  )) || null;
+}
+
+function portPeerSummary(link, equipmentDbId) {
+  if (!link) return null;
+  const isA = link.a_equipment_db_id === equipmentDbId;
+  return {
+    linkId: link.link_id,
+    equipmentDbId: isA ? link.b_equipment_db_id : link.a_equipment_db_id,
+    equipmentId: isA ? link.b_equipment_id : link.a_equipment_id,
+    equipmentName: isA ? link.b_equipment_name : link.a_equipment_name,
+    interfaceType: isA ? link.b_interface_type : link.a_interface_type,
+    portIndex: isA ? link.b_port_index : link.a_port_index,
+    connectionName: isA ? link.b_connection_name : link.a_connection_name,
+  };
+}
+
+function formatPortLabel(interfaceType, portIndex, connectionName = "") {
+  const base = `${interfaceType}${portIndex}`;
+  return connectionName ? `${base} ${connectionName}` : base;
+}
+
+function isLinkDraftPort(equipmentDbId, interfaceType, portIndex) {
+  const draft = state.linkDraft;
+  return Boolean(
+    draft
+    && draft.db_id === equipmentDbId
+    && draft.interface_type === interfaceType
+    && draft.port_index === portIndex,
+  );
+}
+
+function updateLinkDraftBanner() {
+  if (!state.linkDraft) {
+    if (state.placeSpec) {
+      placeBanner.textContent = (
+        `${state.placeSpec.name} 배치: 캔버스를 클릭하세요. (Esc 취소)`
+      );
+      placeBanner.classList.remove("hidden");
+    } else {
+      placeBanner.classList.add("hidden");
+      placeBanner.textContent = "";
+    }
+    return;
+  }
+  if (state.placeSpec) {
+    state.placeSpec = null;
+    board.classList.remove("placing");
+    renderCatalog();
+  }
+  const draft = state.linkDraft;
+  placeBanner.classList.remove("hidden");
+  placeBanner.innerHTML = `
+    연결 중: ${escapeHtml(draft.equipment_id)} /
+    ${escapeHtml(formatPortLabel(draft.interface_type, draft.port_index, draft.connection_name))}
+    — 대상 장비를 선택한 뒤 포트를 클릭하세요
+    <button type="button" id="cancel-link-draft" class="link-draft-cancel">취소</button>
+  `;
+  document.getElementById("cancel-link-draft")?.addEventListener("click", () => {
+    clearLinkDraft();
+  });
+}
+
+function clearLinkDraft() {
+  state.linkDraft = null;
+  updateLinkDraftBanner();
+  const item = selectedItems()[0];
+  if (item) refreshConnectionPanel(item);
+  else setStatus("준비됨");
+}
+
+function renderInterfaceGroupsHtml(item, spec) {
+  const interfaces = interfaceTotals(spec);
+  if (!interfaces.length) {
+    return '<p class="connection-empty">등록된 인터페이스가 없습니다.</p>';
+  }
+  return `
+    <ul class="interface-list">
+      ${interfaces.map((iface) => {
+        const expanded = state.expandedInterfaceType === iface.interface_type;
+        const names = state.connectionNamesByType[iface.interface_type] || [];
+        return `
+          <li class="interface-item${expanded ? " is-expanded" : ""}"
+              data-interface-type="${escapeHtml(iface.interface_type)}">
+            <button type="button" class="interface-type-toggle"
+                    data-interface-type="${escapeHtml(iface.interface_type)}"
+                    aria-expanded="${expanded ? "true" : "false"}">
+              ${escapeHtml(iface.interface_type)}
+            </button>
+            <span class="interface-count">${iface.port_count}</span>
+            ${expanded ? `
+              <div class="interface-ports">
+                ${Array.from({ length: iface.port_count }, (_, index) => {
+                  const portIndex = index + 1;
+                  const name = names[index] || "";
+                  const peer = portPeerSummary(
+                    portLinkFor(item, iface.interface_type, portIndex),
+                    item.db_id,
+                  );
+                  const drafting = isLinkDraftPort(
+                    item.db_id,
+                    iface.interface_type,
+                    portIndex,
+                  );
+                  return `
+                    <div class="interface-port${drafting ? " is-draft" : ""}${peer ? " is-linked" : ""}">
+                      <span class="port-index">${portIndex}</span>
+                      <input class="connection-name-input" type="text" maxlength="80"
+                             data-port-index="${portIndex}"
+                             value="${escapeHtml(name)}"
+                             placeholder="연결 이름"
+                             aria-label="${escapeHtml(iface.interface_type)} ${portIndex} 연결 이름">
+                      <button type="button" class="port-link-button"
+                              data-interface-type="${escapeHtml(iface.interface_type)}"
+                              data-port-index="${portIndex}"
+                              data-connection-name="${escapeHtml(name)}"
+                              title="${peer ? "다시 연결" : "연결 시작/완료"}">
+                        ${drafting ? "선택됨" : "연결"}
+                      </button>
+                      ${peer ? `
+                        <span class="port-peer" title="연결된 포트">
+                          → ${escapeHtml(peer.equipmentName || peer.equipmentId)} /
+                          ${escapeHtml(formatPortLabel(
+                            peer.interfaceType,
+                            peer.portIndex,
+                            peer.connectionName,
+                          ))}
+                        </span>
+                        <button type="button" class="port-unlink-button"
+                                data-link-id="${peer.linkId}"
+                                title="연결 해제" aria-label="연결 해제">해제</button>
+                      ` : '<span class="port-peer"></span>'}
+                    </div>
+                  `;
+                }).join("")}
+                <div class="action-row connection-port-actions">
+                  <button type="button" class="primary save-connection-names"
+                          data-interface-type="${escapeHtml(iface.interface_type)}">이름 저장</button>
+                </div>
+                <p class="form-error connection-name-error" role="alert"></p>
+              </div>
+            ` : ""}
+          </li>
+        `;
+      }).join("")}
+    </ul>
+  `;
+}
+
+function interfaceEditorRowHtml(item = { interface_type: "", port_count: 1 }) {
+  return `
+    <div class="interface-edit-row">
+      <input class="interface-type-input" type="text" maxlength="40"
+             placeholder="종류 (예: BNC)" required
+             value="${escapeHtml(item.interface_type)}" aria-label="인터페이스 종류">
+      <input class="interface-count-input" type="number" min="1" max="9999"
+             value="${Number(item.port_count) || 1}" required aria-label="연결 수량">
+      <button type="button" class="interface-remove" title="항목 제거"
+              aria-label="인터페이스 항목 제거">×</button>
+    </div>
+  `;
+}
+
+function renderConnectionHtml(item, spec) {
+  const editable = spec?.category_key === "broadcast_equipment";
+  if (!state.connectionEditing || !editable) {
+    return `
+      ${state.linkDraft ? `
+        <p class="link-draft-note">
+          연결 모드: 대상 장비의 포트를 클릭하세요.
+          <button type="button" id="cancel-link-draft-panel">취소</button>
+        </p>
+      ` : ""}
+      ${renderInterfaceGroupsHtml(item, spec)}
+      ${editable
+        ? '<div class="action-row"><button id="edit-interfaces">수정</button></div>'
+        : ""}
+    `;
+  }
+  const interfaces = interfaceTotals(spec);
+  return `
+    <form id="interface-edit-form">
+      <div id="interface-edit-list">
+        ${interfaces.map((entry) => interfaceEditorRowHtml(entry)).join("")}
+      </div>
+      <button type="button" id="add-interface" class="interface-add">+ 항목 추가</button>
+      <div class="action-row">
+        <button type="submit" class="primary">저장</button>
+        <button type="button" id="cancel-interface-edit">취소</button>
+      </div>
+      <p id="interface-edit-error" class="form-error" role="alert"></p>
+    </form>
+  `;
+}
+
+function syncConnectionNamesFromDom() {
+  const expanded = state.expandedInterfaceType;
+  if (!expanded) return;
+  const inputs = document.querySelectorAll(
+    `.interface-item[data-interface-type="${CSS.escape(expanded)}"] .connection-name-input`,
+  );
+  if (!inputs.length) return;
+  state.connectionNamesByType[expanded] = [...inputs].map(
+    (input) => input.value.trim(),
+  );
+}
+
+async function ensurePortLinks(item) {
+  if (item._portLinksLoaded) return item._portLinks || [];
+  const links = await api(`/api/equipment/${item.db_id}/port-links`);
+  item._portLinks = links;
+  item._portLinksLoaded = true;
+  return links;
+}
+
+async function loadEquipmentConnections(item) {
+  try {
+    const [rows] = await Promise.all([
+      api(`/api/equipment/${item.db_id}/connections`),
+      ensurePortLinks(item),
+    ]);
+    if (selectedItems()[0]?.db_id !== item.db_id) return;
+    const byType = {};
+    for (const row of rows) {
+      if (!byType[row.interface_type]) byType[row.interface_type] = [];
+      byType[row.interface_type][row.port_index - 1] = row.connection_name || "";
+    }
+    const next = {};
+    for (const iface of interfaceTotals(specFor(item))) {
+      const names = [];
+      for (let index = 0; index < iface.port_count; index += 1) {
+        names.push(byType[iface.interface_type]?.[index] || "");
+      }
+      next[iface.interface_type] = names;
+    }
+    state.connectionNamesByType = next;
+    if (!state.connectionEditing) {
+      refreshConnectionPanel(item);
+    }
+  } catch (error) {
+    const panel = document.getElementById("connection-panel");
+    if (panel && !state.connectionEditing) {
+      const empty = panel.querySelector(".connection-empty");
+      if (empty) empty.textContent = error.message;
+    }
+  }
+}
+
+function refreshConnectionPanel(item, editing = state.inspectorEditing) {
+  const panel = document.getElementById("connection-panel");
+  if (!panel) return;
+  panel.innerHTML = renderConnectionHtml(item, specFor(item));
+  bindConnectionPanel(item, editing);
+  updateLinkDraftBanner();
+}
+
+async function completePortLink(fromDraft, toItem, interfaceType, portIndex, connectionName) {
+  const link = await api("/api/equipment/port-links", {
+    method: "POST",
+    body: JSON.stringify({
+      from: {
+        db_id: fromDraft.db_id,
+        interface_type: fromDraft.interface_type,
+        port_index: fromDraft.port_index,
+      },
+      to: {
+        db_id: toItem.db_id,
+        interface_type: interfaceType,
+        port_index: portIndex,
+      },
+    }),
+  });
+  const touch = (equipment) => {
+    if (!equipment) return;
+    equipment._portLinksLoaded = false;
+    equipment._portLinks = [];
+  };
+  touch(state.items.find((entry) => entry.db_id === fromDraft.db_id));
+  touch(toItem);
+  state.linkDraft = null;
+  updateLinkDraftBanner();
+  await ensurePortLinks(toItem);
+  const source = state.items.find((entry) => entry.db_id === fromDraft.db_id);
+  if (source) await ensurePortLinks(source);
+  refreshConnectionPanel(toItem);
+  loadAllLinks();
+  setStatus(
+    `연결 완료: ${fromDraft.equipment_id}/${formatPortLabel(
+      fromDraft.interface_type,
+      fromDraft.port_index,
+      fromDraft.connection_name,
+    )} ↔ ${toItem.equipment_id}/${formatPortLabel(
+      interfaceType,
+      portIndex,
+      connectionName,
+    )}`,
+  );
+  return link;
+}
+
+function bindConnectionPanel(item, editing) {
+  document.getElementById("cancel-link-draft-panel")?.addEventListener("click", () => {
+    clearLinkDraft();
+  });
+  document.getElementById("edit-interfaces")?.addEventListener("click", () => {
+    syncConnectionNamesFromDom();
+    state.connectionEditing = true;
+    state.expandedInterfaceType = null;
+    state.linkDraft = null;
+    updateLinkDraftBanner();
+    refreshConnectionPanel(item, editing);
+  });
+  document.getElementById("cancel-interface-edit")?.addEventListener("click", () => {
+    state.connectionEditing = false;
+    refreshConnectionPanel(item, editing);
+  });
+  document.getElementById("add-interface")?.addEventListener("click", () => {
+    document
+      .getElementById("interface-edit-list")
+      ?.insertAdjacentHTML("beforeend", interfaceEditorRowHtml());
+  });
+
+  const interfaceForm = document.getElementById("interface-edit-form");
+  interfaceForm?.addEventListener("click", (event) => {
+    const removeButton = event.target.closest(".interface-remove");
+    if (removeButton) removeButton.closest(".interface-edit-row")?.remove();
+  });
+  interfaceForm?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const errorEl = document.getElementById("interface-edit-error");
+    if (errorEl) errorEl.textContent = "";
+    const rows = [...interfaceForm.querySelectorAll(".interface-edit-row")];
+    const interfaces = rows.map((row) => ({
+      interface_type: row.querySelector(".interface-type-input").value.trim(),
+      port_count: Number(row.querySelector(".interface-count-input").value),
+    }));
+    const submitButton = interfaceForm.querySelector("[type='submit']");
+    submitButton.disabled = true;
+    try {
+      const result = await api(
+        `/api/equipment-types/${encodeURIComponent(item.spec_key)}/interfaces`,
+        {
+          method: "PUT",
+          body: JSON.stringify({ interfaces }),
+        },
+      );
+      for (const key of result.spec_keys) {
+        const type = state.typeByKey.get(key);
+        if (type) {
+          type.interfaces = result.interfaces.map((entry) => ({ ...entry }));
+        }
+      }
+      state.connectionEditing = false;
+      await loadEquipmentConnections(item);
+      setStatus(
+        `${specFor(item)?.name || item.spec_key} 연결 정보를 저장했습니다.`,
+      );
+    } catch (error) {
+      if (errorEl) errorEl.textContent = error.message;
+      submitButton.disabled = false;
+    }
+  });
+
+  document.querySelectorAll(".interface-type-toggle").forEach((button) => {
+    button.addEventListener("click", () => {
+      const typeName = button.dataset.interfaceType;
+      syncConnectionNamesFromDom();
+      state.expandedInterfaceType =
+        state.expandedInterfaceType === typeName ? null : typeName;
+      refreshConnectionPanel(item, editing);
+    });
+  });
+
+  document.querySelectorAll(".save-connection-names").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const typeName = button.dataset.interfaceType;
+      const errorEl = button
+        .closest(".interface-ports")
+        ?.querySelector(".connection-name-error");
+      if (errorEl) errorEl.textContent = "";
+      const inputs = [
+        ...document.querySelectorAll(
+          `.interface-item[data-interface-type="${CSS.escape(typeName)}"] .connection-name-input`,
+        ),
+      ];
+      const connectionNames = inputs.map((input) => input.value.trim());
+      button.disabled = true;
+      try {
+        const saved = await api(`/api/equipment/${item.db_id}/connections`, {
+          method: "PUT",
+          body: JSON.stringify({
+            interface_type: typeName,
+            connection_names: connectionNames,
+          }),
+        });
+        state.connectionNamesByType[typeName] = connectionNames;
+        const byIndex = [];
+        for (const row of saved) {
+          byIndex[row.port_index - 1] = row.connection_name || "";
+        }
+        state.connectionNamesByType[typeName] = connectionNames.map(
+          (name, index) => byIndex[index] ?? name,
+        );
+        setStatus(`${typeName} 연결 이름을 저장했습니다.`);
+      } catch (error) {
+        if (errorEl) errorEl.textContent = error.message;
+      } finally {
+        button.disabled = false;
+      }
+    });
+  });
+
+  document.querySelectorAll(".port-link-button").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const interfaceType = button.dataset.interfaceType;
+      const portIndex = Number(button.dataset.portIndex);
+      const connectionName = button.dataset.connectionName || "";
+      const errorEl = button
+        .closest(".interface-ports")
+        ?.querySelector(".connection-name-error");
+      if (errorEl) errorEl.textContent = "";
+      const draft = state.linkDraft;
+      if (
+        draft
+        && draft.db_id === item.db_id
+        && draft.interface_type === interfaceType
+        && draft.port_index === portIndex
+      ) {
+        clearLinkDraft();
+        setStatus("연결을 취소했습니다.");
+        return;
+      }
+      if (draft && draft.db_id !== item.db_id) {
+        button.disabled = true;
+        try {
+          await completePortLink(
+            draft,
+            item,
+            interfaceType,
+            portIndex,
+            connectionName,
+          );
+        } catch (error) {
+          if (errorEl) errorEl.textContent = error.message;
+          setStatus(`연결 실패: ${error.message}`);
+        } finally {
+          button.disabled = false;
+        }
+        return;
+      }
+      state.linkDraft = {
+        db_id: item.db_id,
+        equipment_id: item.equipment_id,
+        interface_type: interfaceType,
+        port_index: portIndex,
+        connection_name: connectionName,
+      };
+      updateLinkDraftBanner();
+      refreshConnectionPanel(item, editing);
+      setStatus(
+        `${item.equipment_id}/${formatPortLabel(interfaceType, portIndex, connectionName)} 연결 시작 — 대상 장비를 선택한 뒤 포트를 클릭하세요.`,
+      );
+    });
+  });
+
+  document.querySelectorAll(".port-unlink-button").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const linkId = Number(button.dataset.linkId);
+      if (!window.confirm("이 포트 연결을 해제할까요?")) return;
+      const errorEl = button
+        .closest(".interface-ports")
+        ?.querySelector(".connection-name-error");
+      if (errorEl) errorEl.textContent = "";
+      button.disabled = true;
+      try {
+        await api(`/api/equipment/port-links/${linkId}`, { method: "DELETE" });
+        item._portLinksLoaded = false;
+        await ensurePortLinks(item);
+        for (const other of state.items) {
+          if (other.db_id !== item.db_id && other._portLinksLoaded) {
+            other._portLinksLoaded = false;
+            other._portLinks = [];
+          }
+        }
+        refreshConnectionPanel(item, editing);
+        loadAllLinks();
+        setStatus("포트 연결을 해제했습니다.");
+      } catch (error) {
+        if (errorEl) errorEl.textContent = error.message;
+      } finally {
+        button.disabled = false;
+      }
+    });
+  });
 }
 
 function renderInspector(editing = state.inspectorEditing) {
@@ -1146,12 +2021,16 @@ function renderInspector(editing = state.inspectorEditing) {
   const photoUrl = item.photo_url
     ? `${item.photo_url}?v=${item._photoCacheBust || 0}`
     : "";
+  const photoSourceLabel = photoSourceCaption(item);
   const photoHtml = photoUrl
     ? `
-      <img class="equipment-photo" src="${escapeHtml(photoUrl)}" alt="${escapeHtml(equipmentPhotoQuery(item) || "장비 이미지")}">
-      ${item.photo_source_url
-        ? `<a class="photo-source" href="${escapeHtml(item.photo_source_url)}" target="_blank" rel="noopener noreferrer">Wikimedia Commons 이미지 출처</a>`
-        : ""}
+      <div class="equipment-photo-wrap">
+        <img class="equipment-photo" src="${escapeHtml(photoUrl)}"
+             alt="${escapeHtml(equipmentPhotoQuery(item) || "장비 이미지")}">
+        <button type="button" id="clear-photo" class="photo-clear"
+                title="이미지 제거" aria-label="이미지 제거">×</button>
+      </div>
+      ${photoSourceLabel}
     `
     : `<p class="photo-empty">${item.equipment_model
         ? "저장된 모델 이미지가 없습니다."
@@ -1168,18 +2047,20 @@ function renderInspector(editing = state.inspectorEditing) {
       </div>
     </section>
     <div class="info-divider"></div>
-    <section class="info-section">
-      <h2>읽기 전용 정보</h2>
-      <div class="info-row"><span class="info-label">장비 ID</span><span class="info-value">${escapeHtml(item.equipment_id)}</span></div>
-      <div class="info-row"><span class="info-label">장비 종류</span><span class="info-value">${escapeHtml(specFor(item)?.name || item.spec_key)}</span></div>
-      <div class="info-row"><span class="info-label">좌표정보</span><span class="info-value">X ${item.world_x.toFixed(1)} / Y ${item.world_y.toFixed(1)}</span></div>
-      <div class="info-row"><span class="info-label">위치 상태</span><span class="info-value">${item.locked ? "고정" : "이동 가능"}</span></div>
+    <section class="info-section connection-section">
+      <h2>연결 정보</h2>
+      <div id="connection-panel">
+        ${renderConnectionHtml(item, specFor(item))}
+      </div>
     </section>
     <div class="info-divider"></div>
     <section class="info-section equipment-photo-section">
       <h2>장비 이미지</h2>
       ${photoHtml}
       ${item._photoError ? `<p class="photo-error">${escapeHtml(item._photoError)}</p>` : ""}
+      ${item._googleImagesUrl
+        ? `<a class="photo-google-link" href="${escapeHtml(item._googleImagesUrl)}" target="_blank" rel="noopener noreferrer">Google 이미지에서 직접 검색</a>`
+        : ""}
       <div class="action-row photo-actions">
         <button id="search-photo" ${item.equipment_model ? "" : "disabled"}>모델 이미지 검색</button>
         <label class="upload-photo-button">
@@ -1187,6 +2068,42 @@ function renderInspector(editing = state.inspectorEditing) {
           <input id="upload-photo" type="file" accept="image/jpeg,image/png,image/webp">
         </label>
       </div>
+    </section>
+    <div class="info-divider"></div>
+    <section class="info-section equipment-log-section">
+      <h2>장비 로그</h2>
+      <div class="log-table" aria-label="장비 로그">
+        <div class="log-row log-header">
+          <span>날짜</span>
+          <span>구분</span>
+          <span>조치사항</span>
+          <span></span>
+        </div>
+        <div id="equipment-log-list" class="log-list">
+          <p class="log-empty">로그를 불러오는 중...</p>
+        </div>
+      </div>
+      <form id="equipment-log-form" class="log-form" data-editing-log-id="">
+        <input id="log-date" name="log_date" type="date" required
+               value="${todayLogDateInput()}" aria-label="날짜">
+        <input id="log-category" name="category" type="text" maxlength="40"
+               placeholder="구분" required list="log-category-options"
+               aria-label="구분">
+        <datalist id="log-category-options">
+          <option value="고장"></option>
+          <option value="변경"></option>
+          <option value="설치"></option>
+          <option value="점검"></option>
+          <option value="수리"></option>
+        </datalist>
+        <input id="log-action" name="action" type="text" maxlength="200"
+               placeholder="조치사항" required aria-label="조치사항">
+        <div class="log-form-actions">
+          <button class="primary" id="log-submit" type="submit">추가</button>
+          <button type="button" id="log-cancel-edit" class="log-cancel-edit" hidden>취소</button>
+        </div>
+      </form>
+      <p id="equipment-log-error" class="form-error" role="alert"></p>
     </section>
   `;
 
@@ -1198,8 +2115,13 @@ function renderInspector(editing = state.inspectorEditing) {
     state.inspectorEditing = false;
     renderInspector(false);
   });
+  bindConnectionPanel(item, editing);
+  loadEquipmentConnections(item);
   document.getElementById("search-photo")?.addEventListener("click", () => {
     searchEquipmentPhoto(item);
+  });
+  document.getElementById("clear-photo")?.addEventListener("click", () => {
+    clearEquipmentPhoto(item);
   });
   document.getElementById("upload-photo")?.addEventListener("change", (event) => {
     const [file] = event.target.files;
@@ -1231,6 +2153,217 @@ function renderInspector(editing = state.inspectorEditing) {
       alert(error.message);
     }
   });
+  bindEquipmentLogForm(item);
+  loadEquipmentLogs(item);
+}
+
+function todayLogDateInput() {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, "0");
+  const day = String(now.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function logDateToInput(value) {
+  const digits = String(value || "").replace(/\D/g, "");
+  if (digits.length !== 8) return todayLogDateInput();
+  return `${digits.slice(0, 4)}-${digits.slice(4, 6)}-${digits.slice(6, 8)}`;
+}
+
+function logDateFromInput(value) {
+  return String(value || "").replace(/\D/g, "");
+}
+
+function resetEquipmentLogForm() {
+  const form = document.getElementById("equipment-log-form");
+  if (!form) return;
+  form.dataset.editingLogId = "";
+  form.reset();
+  document.getElementById("log-date").value = todayLogDateInput();
+  const submitButton = document.getElementById("log-submit");
+  const cancelButton = document.getElementById("log-cancel-edit");
+  if (submitButton) submitButton.textContent = "추가";
+  if (cancelButton) cancelButton.hidden = true;
+  document.querySelectorAll(".log-row.is-editing").forEach((row) => {
+    row.classList.remove("is-editing");
+  });
+}
+
+function fillEquipmentLogForm(log) {
+  const form = document.getElementById("equipment-log-form");
+  if (!form) return;
+  form.dataset.editingLogId = String(log.log_id);
+  document.getElementById("log-date").value = logDateToInput(log.log_date);
+  document.getElementById("log-category").value = log.category;
+  document.getElementById("log-action").value = log.action;
+  const submitButton = document.getElementById("log-submit");
+  const cancelButton = document.getElementById("log-cancel-edit");
+  if (submitButton) submitButton.textContent = "저장";
+  if (cancelButton) cancelButton.hidden = false;
+  document.querySelectorAll(".log-row.is-editing").forEach((row) => {
+    row.classList.remove("is-editing");
+  });
+  document
+    .querySelector(`.log-row[data-log-id="${log.log_id}"]`)
+    ?.classList.add("is-editing");
+  document.getElementById("log-category")?.focus();
+}
+
+function renderEquipmentLogRows(item, logs) {
+  const list = document.getElementById("equipment-log-list");
+  const form = document.getElementById("equipment-log-form");
+  if (!list) return;
+  if (!logs.length) {
+    list.innerHTML = '<p class="log-empty">등록된 로그가 없습니다.</p>';
+    return;
+  }
+  const editingId = form?.dataset.editingLogId || "";
+  list.innerHTML = logs.map((log) => `
+    <div class="log-row${String(log.log_id) === editingId ? " is-editing" : ""}"
+         data-log-id="${log.log_id}">
+      <span class="log-date">${escapeHtml(log.log_date)}</span>
+      <span class="log-category">${escapeHtml(log.category)}</span>
+      <span class="log-action">${escapeHtml(log.action)}</span>
+      <div class="log-row-actions">
+        <button type="button" class="log-edit" data-log-id="${log.log_id}"
+                title="로그 수정" aria-label="로그 수정">✎</button>
+        <button type="button" class="log-delete" data-log-id="${log.log_id}"
+                title="로그 삭제" aria-label="로그 삭제">×</button>
+      </div>
+    </div>
+  `).join("");
+
+  list.querySelectorAll(".log-edit").forEach((button) => {
+    button.addEventListener("click", () => {
+      const logId = Number(button.dataset.logId);
+      const log = logs.find((entry) => entry.log_id === logId);
+      if (log) fillEquipmentLogForm(log);
+    });
+  });
+
+  list.querySelectorAll(".log-delete").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const logId = Number(button.dataset.logId);
+      if (!window.confirm("이 로그를 삭제할까요?")) return;
+      try {
+        await api(`/api/equipment/${item.db_id}/logs/${logId}`, {
+          method: "DELETE",
+        });
+        if (form?.dataset.editingLogId === String(logId)) {
+          resetEquipmentLogForm();
+        }
+        await loadEquipmentLogs(item);
+        setStatus("장비 로그를 삭제했습니다.");
+      } catch (error) {
+        const errorEl = document.getElementById("equipment-log-error");
+        if (errorEl) errorEl.textContent = error.message;
+      }
+    });
+  });
+}
+
+async function loadEquipmentLogs(item) {
+  const list = document.getElementById("equipment-log-list");
+  const errorEl = document.getElementById("equipment-log-error");
+  if (errorEl) errorEl.textContent = "";
+  try {
+    const logs = await api(`/api/equipment/${item.db_id}/logs`);
+    if (selectedItems()[0]?.db_id !== item.db_id) return;
+    renderEquipmentLogRows(item, logs);
+  } catch (error) {
+    if (list) {
+      list.innerHTML = `<p class="log-empty">${escapeHtml(error.message)}</p>`;
+    }
+  }
+}
+
+function bindEquipmentLogForm(item) {
+  const form = document.getElementById("equipment-log-form");
+  const errorEl = document.getElementById("equipment-log-error");
+  const cancelButton = document.getElementById("log-cancel-edit");
+  if (!form) return;
+  cancelButton?.addEventListener("click", () => {
+    resetEquipmentLogForm();
+    if (errorEl) errorEl.textContent = "";
+  });
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (errorEl) errorEl.textContent = "";
+    const submitButton = document.getElementById("log-submit");
+    const editingLogId = form.dataset.editingLogId;
+    const payload = {
+      log_date: logDateFromInput(document.getElementById("log-date").value),
+      category: document.getElementById("log-category").value.trim(),
+      action: document.getElementById("log-action").value.trim(),
+    };
+    if (!payload.log_date || payload.log_date.length !== 8) {
+      if (errorEl) errorEl.textContent = "날짜를 선택해주세요.";
+      return;
+    }
+    submitButton.disabled = true;
+    try {
+      if (editingLogId) {
+        await api(`/api/equipment/${item.db_id}/logs/${editingLogId}`, {
+          method: "PATCH",
+          body: JSON.stringify(payload),
+        });
+        setStatus("장비 로그를 수정했습니다.");
+      } else {
+        await api(`/api/equipment/${item.db_id}/logs`, {
+          method: "POST",
+          body: JSON.stringify(payload),
+        });
+        setStatus("장비 로그를 추가했습니다.");
+      }
+      resetEquipmentLogForm();
+      await loadEquipmentLogs(item);
+    } catch (error) {
+      if (errorEl) errorEl.textContent = error.message;
+    } finally {
+      submitButton.disabled = false;
+    }
+  });
+}
+
+function photoSourceCaption(item) {
+  if (!item.photo_source_url) {
+    return item.photo_query === "manual"
+      ? '<span class="photo-source photo-source-muted">수동 등록</span>'
+      : "";
+  }
+  let label = item.photo_source_label || "";
+  if (!label) {
+    try {
+      const host = new URL(item.photo_source_url).hostname.replace(/^www\./, "");
+      if (host.includes("google.")) label = "Google";
+      else if (host.includes("wikimedia") || host.includes("wikipedia")) label = "Wikimedia";
+      else label = host || "웹";
+    } catch {
+      label = "웹";
+    }
+  }
+  return `<a class="photo-source" href="${escapeHtml(item.photo_source_url)}"
+             target="_blank" rel="noopener noreferrer">© ${escapeHtml(label)}</a>`;
+}
+
+async function clearEquipmentPhoto(item) {
+  if (!item.photo_url) return;
+  if (!window.confirm("등록된 장비 이미지를 제거할까요?")) return;
+  item._photoError = "";
+  try {
+    const updated = await api(`/api/equipment/${item.db_id}/clear-photo`, {
+      method: "POST",
+    });
+    Object.assign(item, updated);
+    item._photoCacheBust = Date.now();
+    renderInspector(false);
+    setStatus("장비 이미지를 제거했습니다.");
+  } catch (error) {
+    item._photoError = error.message;
+    renderInspector(false);
+    setStatus(`이미지 제거 실패: ${error.message}`);
+  }
 }
 
 async function uploadEquipmentPhoto(item, file) {
@@ -1265,12 +2398,25 @@ async function searchEquipmentPhoto(item) {
   const query = equipmentPhotoQuery(item);
   setStatus(`'${query}' 모델 이미지를 검색하는 중...`);
   try {
-    const updated = await api(
-      `/api/equipment/${item.db_id}/search-image`,
-      { method: "POST" },
-    );
-    Object.assign(item, updated);
+    const response = await fetch(`/api/equipment/${item.db_id}/search-image`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const googleUrl = payload.google_images_url
+        || `https://www.google.com/search?tbm=isch&q=${encodeURIComponent(query)}`;
+      item._photoError = payload.error || `검색 실패 (${response.status})`;
+      item._googleImagesUrl = googleUrl;
+      renderInspector(false);
+      setStatus(`이미지 검색 실패: ${item._photoError}`);
+      window.open(googleUrl, "_blank", "noopener,noreferrer");
+      return;
+    }
+    Object.assign(item, payload);
     item._photoCacheBust = Date.now();
+    item._photoError = "";
+    item._googleImagesUrl = "";
     renderInspector(false);
     setStatus(`${query} 이미지를 저장했습니다.`);
   } catch (error) {
@@ -1310,6 +2456,7 @@ async function deleteSelected() {
     pushUndo({ type: "delete", dbIds: [...ids] });
     state.items = state.items.filter((item) => !ids.has(item.db_id));
     clearSelection();
+    loadAllLinks();
     setStatus(`${items.length}개 장비를 삭제했습니다.`);
   } catch (error) {
     alert(error.message);
@@ -1350,7 +2497,7 @@ async function pasteEquipment() {
         const rack = nearestRack(item.world_x, item.world_y);
         if (rack) {
           const minimumOffset =
-            rackMetrics(rack).unitHeight * Math.max(1, Number(spec.ru) || 1);
+            rackMetrics(rack).unitHeight * Math.max(1, instanceRu(item, spec));
           item.world_y += Math.max(0, minimumOffset - offset);
         }
       }
@@ -1450,7 +2597,25 @@ function finishMarquee() {
   setSelection(ids);
 }
 
-function showTooltip(item, x, y) {
+function tooltipConnectionLines(item, links) {
+  const lines = [];
+  for (const link of links) {
+    const peer = portPeerSummary(link, item.db_id);
+    if (!peer) continue;
+    const localIsA = link.a_equipment_db_id === item.db_id;
+    const localType = localIsA ? link.a_interface_type : link.b_interface_type;
+    const localIndex = localIsA ? link.a_port_index : link.b_port_index;
+    const localName = localIsA ? link.a_connection_name : link.b_connection_name;
+    lines.push(
+      `${formatPortLabel(localType, localIndex, localName)} → `
+      + `${peer.equipmentName || peer.equipmentId} / `
+      + `${formatPortLabel(peer.interfaceType, peer.portIndex, peer.connectionName)}`,
+    );
+  }
+  return lines;
+}
+
+async function showTooltip(item, x, y) {
   if (
     item.spec_key.startsWith("blank_panel_") ||
     item.spec_key === "drawer_2ru"
@@ -1458,17 +2623,34 @@ function showTooltip(item, x, y) {
     hideTooltip();
     return;
   }
+  const hoverToken = `${item.db_id}:${x}:${y}`;
+  state._tooltipToken = hoverToken;
   const spec = specFor(item);
+  let linkHtml = "";
+  try {
+    const links = await ensurePortLinks(item);
+    if (state._tooltipToken !== hoverToken) return;
+    const lines = tooltipConnectionLines(item, links);
+    if (lines.length) {
+      const visible = lines.slice(0, 5);
+      const extra = lines.length - visible.length;
+      linkHtml = `<br>${visible.map((line) => (
+        `연결: ${escapeHtml(line)}`
+      )).join("<br>")}`;
+      if (extra > 0) {
+        linkHtml += `<br>연결: 외 ${extra}건`;
+      }
+    }
+  } catch {
+    // tooltip still shows name/id
+  }
+  if (state._tooltipToken !== hoverToken) return;
   tooltip.innerHTML = `
     <strong>${escapeHtml(item.equipment_name || spec?.name || item.spec_key)}</strong><br>
-    ID: ${escapeHtml(item.equipment_id)}<br>
-    업체: ${escapeHtml(item.equipment_vendor || "-")}<br>
-    모델: ${escapeHtml(item.equipment_model || "-")}<br>
-    좌표: X ${item.world_x.toFixed(1)} / Y ${item.world_y.toFixed(1)}<br>
-    상태: ${item.locked ? "고정" : "이동 가능"}
+    ID: ${escapeHtml(item.equipment_id)}${linkHtml}
   `;
-  tooltip.style.left = `${Math.min(x + 14, wrap.clientWidth - 245)}px`;
-  tooltip.style.top = `${Math.min(y + 14, wrap.clientHeight - 125)}px`;
+  tooltip.style.left = `${Math.min(x + 14, wrap.clientWidth - 260)}px`;
+  tooltip.style.top = `${Math.min(y + 14, wrap.clientHeight - 140)}px`;
   tooltip.classList.remove("hidden");
 }
 
@@ -1489,6 +2671,196 @@ function showContextMenu(x, y) {
 function hideContextMenu() {
   contextMenu.classList.add("hidden");
 }
+
+async function loadAllLinks() {
+  try {
+    state.links = await api("/api/port-links");
+  } catch {
+    state.links = [];
+  }
+  draw();
+}
+
+function setCableMode(active) {
+  state.cableMode = active;
+  cableModeButton.classList.toggle("is-active", active);
+  cableModeButton.setAttribute("aria-pressed", active ? "true" : "false");
+  board.classList.toggle("cabling", active);
+  if (active) {
+    cancelPlacement();
+    hideTooltip();
+    setStatus("케이블 연결 모드: 장비를 클릭해 포트를 선택하세요. (Esc 종료)");
+  } else {
+    closePortMenu();
+    if (state.linkDraft) clearLinkDraft();
+    setStatus("준비됨");
+  }
+}
+
+function closePortMenu() {
+  portMenu.classList.add("hidden");
+  portMenu.innerHTML = "";
+  state.portMenuItemId = null;
+}
+
+async function fetchConnectionNames(item) {
+  try {
+    const rows = await api(`/api/equipment/${item.db_id}/connections`);
+    const byType = {};
+    for (const row of rows) {
+      (byType[row.interface_type] ||= [])[row.port_index - 1] =
+        row.connection_name || "";
+    }
+    return byType;
+  } catch {
+    return {};
+  }
+}
+
+function portMenuHtml(item, byType) {
+  const spec = specFor(item);
+  const title = escapeHtml(item.equipment_name || spec?.name || item.spec_key);
+  let html =
+    `<div class="port-menu-title">${title} · ${escapeHtml(item.equipment_id)}</div>`;
+  const ifaces = interfaceTotals(spec);
+  if (!ifaces.length) {
+    return `${html}<div class="port-menu-empty">등록된 포트가 없습니다.</div>`;
+  }
+  const draft = state.linkDraft;
+  if (draft && draft.db_id !== item.db_id) {
+    html += `<div class="port-menu-hint">${escapeHtml(
+      `${draft.equipment_id}/${formatPortLabel(
+        draft.interface_type,
+        draft.port_index,
+        draft.connection_name,
+      )} → 연결할 포트 선택`,
+    )}</div>`;
+  } else {
+    html += '<div class="port-menu-hint">시작할 포트를 선택하세요</div>';
+  }
+  const rows = [];
+  for (const iface of ifaces) {
+    for (let index = 1; index <= iface.port_count; index += 1) {
+      const name = byType[iface.interface_type]?.[index - 1] || "";
+      const link = portLinkFor(item, iface.interface_type, index);
+      const peer = portPeerSummary(link, item.db_id);
+      const isDraft = Boolean(
+        draft
+        && draft.db_id === item.db_id
+        && draft.interface_type === iface.interface_type
+        && draft.port_index === index,
+      );
+      rows.push(`
+        <div class="port-menu-row${peer ? " is-linked" : ""}${isDraft ? " is-draft" : ""}">
+          <button type="button" class="port-menu-select"
+                  data-interface-type="${escapeHtml(iface.interface_type)}"
+                  data-port-index="${index}"
+                  data-connection-name="${escapeHtml(name)}">
+            <span class="port-menu-label">${escapeHtml(
+              formatPortLabel(iface.interface_type, index, name),
+            )}</span>
+            ${peer ? `<span class="port-menu-peer">→ ${escapeHtml(peer.equipmentId)} / ${escapeHtml(
+              formatPortLabel(peer.interfaceType, peer.portIndex, peer.connectionName),
+            )}</span>` : ""}
+          </button>
+          ${peer ? `<button type="button" class="port-menu-unlink" data-link-id="${peer.linkId}">해제</button>` : ""}
+        </div>
+      `);
+    }
+  }
+  return `${html}<div class="port-menu-list">${rows.join("")}</div>`;
+}
+
+async function openPortMenu(item, x, y) {
+  hideTooltip();
+  hideContextMenu();
+  item._portLinksLoaded = false;
+  await ensurePortLinks(item);
+  const byType = await fetchConnectionNames(item);
+  state.portMenuItemId = item.db_id;
+  portMenu.innerHTML = portMenuHtml(item, byType);
+  portMenu.classList.remove("hidden");
+  const menuWidth = portMenu.offsetWidth || 236;
+  const menuHeight = portMenu.offsetHeight || 200;
+  portMenu.style.left =
+    `${Math.max(4, Math.min(x, wrap.clientWidth - menuWidth - 4))}px`;
+  portMenu.style.top =
+    `${Math.max(4, Math.min(y, wrap.clientHeight - menuHeight - 4))}px`;
+}
+
+async function handlePortSelect(item, interfaceType, portIndex, connectionName) {
+  const draft = state.linkDraft;
+  if (
+    draft
+    && draft.db_id === item.db_id
+    && draft.interface_type === interfaceType
+    && draft.port_index === portIndex
+  ) {
+    clearLinkDraft();
+    closePortMenu();
+    setStatus("연결을 취소했습니다.");
+    return;
+  }
+  if (draft && draft.db_id !== item.db_id) {
+    try {
+      await completePortLink(draft, item, interfaceType, portIndex, connectionName);
+      closePortMenu();
+    } catch (error) {
+      setStatus(`연결 실패: ${error.message}`);
+    }
+    return;
+  }
+  state.linkDraft = {
+    db_id: item.db_id,
+    equipment_id: item.equipment_id,
+    interface_type: interfaceType,
+    port_index: portIndex,
+    connection_name: connectionName,
+  };
+  updateLinkDraftBanner();
+  closePortMenu();
+  setStatus(
+    `${item.equipment_id}/${formatPortLabel(interfaceType, portIndex, connectionName)}`
+    + " 연결 시작 — 다른 장비를 클릭해 포트를 선택하세요.",
+  );
+}
+
+portMenu.addEventListener("click", async (event) => {
+  const item = state.items.find(
+    (entry) => entry.db_id === state.portMenuItemId,
+  );
+  if (!item) return;
+  const unlinkButton = event.target.closest(".port-menu-unlink");
+  if (unlinkButton) {
+    const linkId = Number(unlinkButton.dataset.linkId);
+    try {
+      await api(`/api/equipment/port-links/${linkId}`, { method: "DELETE" });
+      for (const entry of state.items) {
+        entry._portLinksLoaded = false;
+        entry._portLinks = [];
+      }
+      await loadAllLinks();
+      await ensurePortLinks(item);
+      const byType = await fetchConnectionNames(item);
+      portMenu.innerHTML = portMenuHtml(item, byType);
+      setStatus("포트 연결을 해제했습니다.");
+    } catch (error) {
+      setStatus(`해제 실패: ${error.message}`);
+    }
+    return;
+  }
+  const selectButton = event.target.closest(".port-menu-select");
+  if (selectButton) {
+    await handlePortSelect(
+      item,
+      selectButton.dataset.interfaceType,
+      Number(selectButton.dataset.portIndex),
+      selectButton.dataset.connectionName || "",
+    );
+  }
+});
+
+cableModeButton.addEventListener("click", () => setCableMode(!state.cableMode));
 
 board.addEventListener("wheel", (event) => {
   event.preventDefault();
@@ -1513,6 +2885,12 @@ board.addEventListener("mousedown", (event) => {
     return;
   }
   if (event.button !== 0) return;
+  if (state.cableMode) {
+    const target = hitTest(point.x, point.y);
+    if (target) openPortMenu(target, point.x, point.y);
+    else closePortMenu();
+    return;
+  }
   if (state.placeSpec) {
     placeEquipment(state.placeSpec, point.x, point.y);
     return;
@@ -1579,6 +2957,10 @@ window.addEventListener("mousemove", (event) => {
   if (state.marquee) {
     state.marquee.current = point;
     draw();
+    return;
+  }
+  if (state.cableMode) {
+    hideTooltip();
     return;
   }
   if (
@@ -1665,16 +3047,38 @@ contextMenu.addEventListener("click", async (event) => {
 
 document.addEventListener("mousedown", (event) => {
   if (!contextMenu.contains(event.target)) hideContextMenu();
+  if (!portMenu.contains(event.target) && !board.contains(event.target)) {
+    closePortMenu();
+  }
 });
 
+function isTextFieldTarget(target) {
+  return Boolean(
+    target?.closest?.("input, textarea, select, [contenteditable='true']"),
+  );
+}
+
+function hasTextSelection() {
+  const selection = window.getSelection();
+  return Boolean(
+    selection && !selection.isCollapsed && selection.toString().length,
+  );
+}
+
+function isInspectorTarget(target) {
+  return Boolean(target?.closest?.(".inspector"));
+}
+
 document.addEventListener("keydown", (event) => {
-  if (event.target.matches("input")) return;
+  if (isTextFieldTarget(event.target)) return;
   if (event.ctrlKey && event.key.toLowerCase() === "z") {
     event.preventDefault();
     undoLastAction();
     return;
   }
   if (event.ctrlKey && event.key.toLowerCase() === "c") {
+    // 우측 장비 정보 등에서 드래그 선택한 텍스트는 브라우저 기본 복사 사용
+    if (hasTextSelection() || isInspectorTarget(event.target)) return;
     if (state.selected.size) {
       event.preventDefault();
       copySelected();
@@ -1682,15 +3086,30 @@ document.addEventListener("keydown", (event) => {
     return;
   }
   if (event.ctrlKey && event.key.toLowerCase() === "v") {
+    if (isInspectorTarget(event.target)) return;
     event.preventDefault();
     pasteEquipment();
     return;
   }
   if (event.key === "Escape") {
+    if (!portMenu.classList.contains("hidden")) {
+      closePortMenu();
+      return;
+    }
+    if (state.linkDraft) {
+      clearLinkDraft();
+      setStatus("연결을 취소했습니다.");
+      return;
+    }
+    if (state.cableMode) {
+      setCableMode(false);
+      return;
+    }
     if (!cancelPlacement()) hideContextMenu();
     return;
   }
   if (event.key === "Delete") {
+    if (hasTextSelection() || isInspectorTarget(event.target)) return;
     event.preventDefault();
     deleteSelected();
     return;
@@ -1702,6 +3121,7 @@ document.addEventListener("keydown", (event) => {
     ArrowDown: [0, 1],
   };
   if (!directions[event.key]) return;
+  if (isInspectorTarget(event.target)) return;
   const items = selectedItems().filter((item) => !item.locked);
   if (!items.length) return;
   event.preventDefault();
@@ -1734,6 +3154,30 @@ document.getElementById("zoom-out").addEventListener("click", () => {
 });
 zoomEl.addEventListener("click", resetView);
 
+editCatalogButton.addEventListener("click", openCatalogEditor);
+closeCatalogEditorButton.addEventListener("click", () => {
+  catalogEditorDialog.close();
+});
+addEquipmentTypeButton.addEventListener("click", () => {
+  openEquipmentTypeDialog();
+});
+document
+  .getElementById("cancel-equipment-type")
+  .addEventListener("click", () => equipmentTypeDialog.close());
+newTypeName.addEventListener("input", () => {
+  if (newTypePrefix.dataset.manual !== "true") {
+    newTypePrefix.value = suggestedIdPrefix(newTypeName.value);
+  }
+});
+newTypePrefix.addEventListener("input", () => {
+  newTypePrefix.dataset.manual = "true";
+  newTypePrefix.value = newTypePrefix.value.toUpperCase();
+});
+equipmentTypeForm.addEventListener("submit", saveEquipmentType);
+equipmentTypeDialog.addEventListener("close", () => {
+  state.typeEditor = null;
+});
+
 async function initialize() {
   try {
     const [types, items] = await Promise.all([
@@ -1750,6 +3194,7 @@ async function initialize() {
     renderCatalog();
     renderInspector();
     resizeCanvas();
+    loadAllLinks();
     setStatus("준비됨 — 마우스 휠 줌 / 가운데 버튼 이동");
   } catch (error) {
     setStatus(`초기화 오류: ${error.message}`);

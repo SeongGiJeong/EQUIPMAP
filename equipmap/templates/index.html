@@ -14,12 +14,23 @@
       <button id="zoom-reset" class="zoom-value" title="100%로 초기화">100%</button>
       <button id="zoom-in" title="확대">＋</button>
     </div>
+    <div class="toolbar-group" aria-label="연결">
+      <button id="cable-mode" class="cable-mode-button" type="button"
+              aria-pressed="false" title="케이블 연결 모드 (장비 클릭 → 포트 선택)">
+        케이블 연결
+      </button>
+    </div>
     <div id="status" class="status">불러오는 중...</div>
   </header>
 
   <main class="workspace">
     <aside class="palette panel">
-      <h1>장비 목록</h1>
+      <div class="palette-header">
+        <h1>장비 목록</h1>
+        <button id="edit-catalog" class="edit-catalog-button" type="button">
+          수정
+        </button>
+      </div>
       <div id="catalog"></div>
       <p class="help">
         모델을 누른 뒤 캔버스를 클릭하거나<br>
@@ -31,6 +42,7 @@
       <canvas id="board" tabindex="0" aria-label="장비 배치 캔버스"></canvas>
       <div id="place-banner" class="place-banner hidden"></div>
       <div id="tooltip" class="tooltip hidden"></div>
+      <div id="port-menu" class="port-menu hidden"></div>
       <div id="context-menu" class="context-menu hidden">
         <button data-action="move">이동</button>
         <button data-action="lock">고정</button>
@@ -46,6 +58,66 @@
       </div>
     </aside>
   </main>
+
+  <dialog id="catalog-editor-dialog" class="catalog-editor-dialog">
+    <div class="catalog-editor">
+      <header class="catalog-editor-header">
+        <h2>장비 목록 수정</h2>
+        <div class="catalog-editor-header-actions">
+          <button id="add-equipment-type" type="button">＋ 장비 추가</button>
+          <button id="close-catalog-editor" type="button">닫기</button>
+        </div>
+      </header>
+      <div id="catalog-editor-list" class="catalog-editor-list"></div>
+      <p id="catalog-editor-error" class="form-error" role="alert"></p>
+    </div>
+  </dialog>
+
+  <dialog id="equipment-type-dialog" class="equipment-type-dialog">
+    <form id="equipment-type-form">
+      <h2 id="equipment-type-dialog-title">장비 종류 추가</h2>
+      <label>
+        대그룹 이름
+        <input id="new-type-category" name="category_name" maxlength="40"
+               list="equipment-category-options" required
+               placeholder="예: 방송장비">
+        <datalist id="equipment-category-options"></datalist>
+      </label>
+      <label>
+        장비 이름
+        <input id="new-type-name" name="name" maxlength="60" required
+               placeholder="예: ROUTER">
+      </label>
+      <label id="new-type-prefix-field">
+        장비 ID 접두사
+        <input id="new-type-prefix" name="id_prefix" maxlength="20" required
+               pattern="[A-Za-z][A-Za-z0-9_]*" placeholder="예: ROUTER">
+      </label>
+      <p id="new-type-prefix-help" class="field-help">
+        ID는 ROUTER-000001 형식으로 생성됩니다.
+      </p>
+      <label id="new-type-ru-field">
+        장비 크기
+        <span class="dialog-ru-input">
+          <input id="new-type-ru" name="ru" type="number"
+                 min="1" max="46" step="1" value="1" required>
+          RU
+        </span>
+      </label>
+      <label id="new-type-half-field" class="checkbox-label">
+        <input id="new-type-half" name="is_half" type="checkbox">
+        Half 사이즈 (좌우 길이 절반)
+      </label>
+      <p id="new-type-ru-help" class="field-help hidden">
+        RU는 1~46까지 입력할 수 있습니다.
+      </p>
+      <p id="equipment-type-error" class="form-error" role="alert"></p>
+      <div class="dialog-actions">
+        <button id="cancel-equipment-type" type="button">취소</button>
+        <button id="save-equipment-type" class="primary" type="submit">추가</button>
+      </div>
+    </form>
+  </dialog>
 
   <script src="{{ url_for('static', filename='app.js') }}"></script>
 </body>
