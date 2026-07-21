@@ -42,6 +42,8 @@ def _equipment_payload(record: EquipmentRecord) -> dict:
         if record.photo_path
         else ""
     )
+    payload["parent_equipment_id"] = record.parent_equipment_id
+    payload["slot_index"] = record.slot_index
     return payload
 
 
@@ -294,6 +296,10 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> Flask:
             record.db_id: record
             for record in repository.list_all()
         }
+        raw_parent = values.get("parent_db_id")
+        target_parent_id = int(raw_parent) if raw_parent is not None else None
+        raw_slot = values.get("slot_index")
+        target_slot_index = int(raw_slot) if raw_slot is not None else None
         created_records: list[EquipmentRecord] = []
         for db_id in db_ids:
             source = by_id.get(db_id)
@@ -304,9 +310,24 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> Flask:
                     source.db_id,
                     offset_x=offset_x,
                     offset_y=offset_y,
+                    parent_db_id=(
+                        target_parent_id
+                        if source.parent_equipment_id is not None
+                        else None
+                    ),
+                    slot_index=(
+                        target_slot_index
+                        if (
+                            source.parent_equipment_id is not None
+                            and target_slot_index is not None
+                        )
+                        else None
+                    ),
                 )
             except (TypeError, ValueError) as error:
                 return jsonify({"error": str(error)}), 400
+            # 지정 슬롯은 첫 카드에만 적용하고, 나머지는 빈 슬롯에 순차 배치
+            target_slot_index = None
             if source.photo_path:
                 source_photo = (
                     EQUIPMENT_IMAGE_DIR / Path(source.photo_path).name
@@ -324,12 +345,14 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> Flask:
                         photo_source_url=source.photo_source_url,
                         photo_query=source.photo_query,
                     )
-                    created = next(
-                        record
-                        for record in repository.list_all()
-                        if record.db_id == created.db_id
-                    )
+                    refreshed = repository.get(created.db_id)
+                    if refreshed is not None:
+                        created = refreshed
             created_records.append(created)
+            if created.parent_equipment_id is None:
+                created_records.extend(
+                    repository.list_child_equipment(created.db_id)
+                )
 
         if not created_records:
             return jsonify({"error": "복사할 장비를 찾을 수 없습니다."}), 404
@@ -539,6 +562,76 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> Flask:
             if record.db_id == db_id
         )
         return jsonify(_equipment_payload(updated))
+
+    @app.put("/api/equipment/<int:db_id>/slots")
+    def equipment_slots_update(db_id: int):
+        values = request.get_json(silent=True) or {}
+        try:
+            record = repository.set_frame_slot_count(
+                db_id,
+                int(values.get("slot_count")),
+            )
+        except (TypeError, ValueError) as error:
+            return jsonify({"error": str(error)}), 400
+        return jsonify(
+            {
+                "frame": _equipment_payload(record),
+                "slot_count": repository.frame_slot_count_for(record),
+            }
+        )
+
+    @app.get("/api/equipment/<int:db_id>/slots")
+    def equipment_slots(db_id: int):
+        frame = repository.get(db_id)
+        if frame is None:
+            return jsonify({"error": "장비를 찾을 수 없습니다."}), 404
+        try:
+            slot_count = repository.frame_slot_count_for(frame)
+        except ValueError as error:
+            return jsonify({"error": str(error)}), 400
+        children = {
+            child.slot_index: child
+            for child in repository.list_child_equipment(db_id)
+            if child.slot_index is not None
+        }
+        slots = []
+        for index in range(1, slot_count + 1):
+            card = children.get(index)
+            slots.append(
+                {
+                    "slot_index": index,
+                    "card": _equipment_payload(card) if card else None,
+                }
+            )
+        return jsonify(
+            {
+                "frame_db_id": db_id,
+                "slot_count": slot_count,
+                "slots": slots,
+            }
+        )
+
+    @app.post("/api/equipment/<int:db_id>/slots/<int:slot_index>/mount")
+    def equipment_slot_mount(db_id: int, slot_index: int):
+        values = request.get_json(silent=True) or {}
+        try:
+            record = repository.mount_module_card(
+                db_id,
+                slot_index=slot_index,
+                spec_key=str(values.get("spec_key", "")).strip(),
+                equipment_name=str(values.get("equipment_name", "")),
+            )
+        except (TypeError, ValueError) as error:
+            return jsonify({"error": str(error)}), 400
+        return jsonify(_equipment_payload(record)), 201
+
+    @app.delete("/api/equipment/<int:db_id>/slots/<int:slot_index>")
+    def equipment_slot_unmount(db_id: int, slot_index: int):
+        try:
+            repository.unmount_module_card(db_id, slot_index)
+        except ValueError as error:
+            return jsonify({"error": str(error)}), 404
+        return ("", 204)
 
     @app.delete("/api/equipment/<int:db_id>")
     def equipment_delete(db_id: int):

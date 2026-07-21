@@ -177,12 +177,45 @@ DEFAULT_INTERFACE_PROFILES: dict[str, tuple[tuple[str, str, int, int], ...]] = {
         ("제어", "Serial", 1, 40),
         ("전원", "Power", 1, 50),
     ),
+    # 프레임(케이스) 자체는 전원/제어 위주. 신호 포트는 내부 카드가 담당.
     "MODULE_FRAME": (
+        ("전원", "Power", 2, 10),
+        ("네트워크", "Ethernet", 2, 20),
+        ("제어", "Serial", 1, 30),
+    ),
+    "CARD_DA": (
+        ("영상", "BNC", 8, 10),
+        ("전원", "Power", 1, 20),
+    ),
+    "CARD_EMBED": (
+        ("영상", "BNC", 4, 10),
+        ("음성", "XLR", 4, 20),
+        ("전원", "Power", 1, 30),
+    ),
+    "CARD_DEEMBED": (
+        ("영상", "BNC", 4, 10),
+        ("음성", "XLR", 4, 20),
+        ("전원", "Power", 1, 30),
+    ),
+    "CARD_CONV": (
+        ("영상", "BNC", 2, 10),
+        ("영상", "HDMI", 2, 20),
+        ("전원", "Power", 1, 30),
+    ),
+    "CARD_PROC": (
+        ("영상", "BNC", 4, 10),
+        ("네트워크", "Ethernet", 1, 20),
+        ("전원", "Power", 1, 30),
+    ),
+    "CARD_ROUTER": (
         ("영상", "BNC", 16, 10),
-        ("음성", "XLR", 8, 20),
-        ("네트워크", "Ethernet", 2, 30),
-        ("제어", "Serial", 2, 40),
-        ("전원", "Power", 2, 50),
+        ("제어", "Serial", 1, 20),
+        ("전원", "Power", 1, 30),
+    ),
+    "CARD": (
+        ("영상", "BNC", 4, 10),
+        ("네트워크", "Ethernet", 1, 20),
+        ("전원", "Power", 1, 30),
     ),
     "MONITOR": (
         ("영상", "BNC", 2, 10),
@@ -234,6 +267,37 @@ DEFAULT_EQUIPMENT_TYPES += tuple(
     for ru in range(1, 11)
 )
 
+# MODULE FRAME 내부에 장착하는 슬롯 카드 (캔버스 배치 대상 아님)
+MODULE_CARD_DEFINITIONS = (
+    ("module_card_da", "DA", "CARD_DA", 10),
+    ("module_card_embed", "EMBED", "CARD_EMBED", 20),
+    ("module_card_deembed", "DEEMBED", "CARD_DEEMBED", 30),
+    ("module_card_converter", "CONVERTER", "CARD_CONV", 40),
+    ("module_card_proc", "PROC", "CARD_PROC", 50),
+    ("module_card_router", "ROUTER CARD", "CARD_ROUTER", 60),
+    ("module_card_generic", "MODULE CARD", "CARD", 70),
+)
+
+DEFAULT_EQUIPMENT_TYPES += tuple(
+    (
+        key,
+        "module_card",
+        "모듈카드",
+        name,
+        0,
+        "equipmap/assets/broadcast_equipment_icon.png",
+        "equipmap/assets/solid_rack_device.png",
+        "equipmap/assets/solid_rack_device.png",
+        RACK_MOUNT_WIDTH * 0.2,
+        RACK_RU_HEIGHT * 0.8,
+        400 + sort_order,
+        id_prefix,
+    )
+    for key, name, id_prefix, sort_order in MODULE_CARD_DEFINITIONS
+)
+
+DEFAULT_FRAME_SLOT_COUNT = 10
+
 
 @dataclass(frozen=True)
 class EquipmentTypeRecord:
@@ -251,6 +315,7 @@ class EquipmentTypeRecord:
     sort_order: int
     id_prefix: str
     is_half: bool
+    frame_slot_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -271,6 +336,9 @@ class EquipmentRecord:
     layout_width: float
     layout_height: float
     locked: bool
+    parent_equipment_id: int | None = None
+    slot_index: int | None = None
+    frame_slot_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -398,8 +466,28 @@ class EquipmentRepository:
                     "ALTER TABLE equipment ADD COLUMN deleted "
                     "INTEGER NOT NULL DEFAULT 0 CHECK (deleted IN (0, 1))"
                 )
+            if "parent_equipment_id" not in columns:
+                connection.execute(
+                    "ALTER TABLE equipment ADD COLUMN parent_equipment_id "
+                    "INTEGER REFERENCES equipment(id)"
+                )
+            if "slot_index" not in columns:
+                connection.execute(
+                    "ALTER TABLE equipment ADD COLUMN slot_index INTEGER"
+                )
+            if "frame_slot_count" not in columns:
+                connection.execute(
+                    "ALTER TABLE equipment ADD COLUMN frame_slot_count "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_equipment_spec_key ON equipment(spec_key)"
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_equipment_parent
+                ON equipment(parent_equipment_id, slot_index)
+                """
             )
             connection.execute(
                 """
@@ -438,6 +526,11 @@ class EquipmentRepository:
                 connection.execute(
                     "ALTER TABLE equipment_types ADD COLUMN is_half "
                     "INTEGER NOT NULL DEFAULT 0 CHECK (is_half IN (0, 1))"
+                )
+            if "frame_slot_count" not in type_columns:
+                connection.execute(
+                    "ALTER TABLE equipment_types ADD COLUMN frame_slot_count "
+                    "INTEGER NOT NULL DEFAULT 0"
                 )
             connection.executemany(
                 """
@@ -480,6 +573,16 @@ class EquipmentRepository:
                 WHERE spec_key LIKE 'blank_panel_%ru'
                   AND name GLOB '[0-9]*RU'
                 """
+            )
+            connection.execute(
+                """
+                UPDATE equipment_types
+                SET frame_slot_count = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id_prefix = 'MODULE_FRAME'
+                  AND (frame_slot_count IS NULL OR frame_slot_count <= 0)
+                """,
+                (DEFAULT_FRAME_SLOT_COUNT,),
             )
             connection.execute(
                 """
@@ -609,11 +712,7 @@ class EquipmentRepository:
 
     @staticmethod
     def _seed_default_interfaces(connection: sqlite3.Connection) -> None:
-        existing = connection.execute(
-            "SELECT COUNT(*) AS count FROM equipment_type_interfaces"
-        ).fetchone()
-        if int(existing["count"]) > 0:
-            return
+        """인터페이스가 없는 장비 종류에만 기본 프로파일을 채운다."""
         rows = connection.execute(
             """
             SELECT spec_key, id_prefix
@@ -623,6 +722,16 @@ class EquipmentRepository:
         ).fetchall()
         inserts: list[tuple[str, str, str, int, int]] = []
         for row in rows:
+            existing = connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM equipment_type_interfaces
+                WHERE spec_key = ?
+                """,
+                (str(row["spec_key"]),),
+            ).fetchone()
+            if int(existing["count"]) > 0:
+                continue
             profile = DEFAULT_INTERFACE_PROFILES.get(str(row["id_prefix"]))
             if not profile:
                 continue
@@ -758,7 +867,7 @@ class EquipmentRepository:
         with self._connection() as connection:
             type_row = connection.execute(
                 """
-                SELECT id_prefix
+                SELECT id_prefix, category_key
                 FROM equipment_types
                 WHERE spec_key = ? AND active = 1
                 """,
@@ -766,6 +875,10 @@ class EquipmentRepository:
             ).fetchone()
             if type_row is None:
                 raise ValueError("알 수 없는 장비 종류입니다.")
+            if str(type_row["category_key"]) == "module_card":
+                raise ValueError(
+                    "모듈 카드는 MODULE FRAME 슬롯에 장착해서 추가하세요."
+                )
             cursor = connection.execute(
                 """
                 INSERT INTO equipment (
@@ -808,6 +921,216 @@ class EquipmentRepository:
                 "SELECT * FROM equipment WHERE deleted = 0 ORDER BY id"
             ).fetchall()
         return [self._to_record(row) for row in rows]
+
+    def get(self, db_id: int) -> EquipmentRecord | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM equipment WHERE id = ? AND deleted = 0",
+                (db_id,),
+            ).fetchone()
+        return self._to_record(row) if row is not None else None
+
+    def list_child_equipment(
+        self,
+        parent_db_id: int,
+    ) -> list[EquipmentRecord]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM equipment
+                WHERE deleted = 0
+                  AND parent_equipment_id = ?
+                ORDER BY slot_index, id
+                """,
+                (parent_db_id,),
+            ).fetchall()
+        return [self._to_record(row) for row in rows]
+
+    def frame_slot_count_for(self, frame: EquipmentRecord) -> int:
+        """인스턴스 슬롯 수가 있으면 우선, 없으면 종류 기본값을 사용한다."""
+        if int(frame.frame_slot_count or 0) > 0:
+            return int(frame.frame_slot_count)
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT frame_slot_count, id_prefix
+                FROM equipment_types
+                WHERE spec_key = ? AND active = 1
+                """,
+                (frame.spec_key,),
+            ).fetchone()
+        if row is None:
+            raise ValueError("프레임 장비 종류를 찾을 수 없습니다.")
+        count = int(row["frame_slot_count"] or 0)
+        if count <= 0 and str(row["id_prefix"]) == "MODULE_FRAME":
+            return DEFAULT_FRAME_SLOT_COUNT
+        return count
+
+    def set_frame_slot_count(
+        self,
+        frame_db_id: int,
+        slot_count: int,
+    ) -> EquipmentRecord:
+        """MODULE FRAME 인스턴스의 슬롯 수를 변경한다."""
+        count = int(slot_count)
+        if not 1 <= count <= 64:
+            raise ValueError("슬롯 수는 1~64 사이여야 합니다.")
+        frame = self.get(frame_db_id)
+        if frame is None:
+            raise ValueError("프레임 장비를 찾을 수 없습니다.")
+        if frame.parent_equipment_id is not None:
+            raise ValueError("모듈 카드의 슬롯 수는 변경할 수 없습니다.")
+        with self._connection() as connection:
+            type_row = connection.execute(
+                """
+                SELECT id_prefix, frame_slot_count
+                FROM equipment_types
+                WHERE spec_key = ? AND active = 1
+                """,
+                (frame.spec_key,),
+            ).fetchone()
+            if type_row is None:
+                raise ValueError("프레임 장비 종류를 찾을 수 없습니다.")
+            type_slots = int(type_row["frame_slot_count"] or 0)
+            if type_slots <= 0 and str(type_row["id_prefix"]) != "MODULE_FRAME":
+                raise ValueError("이 장비에는 슬롯이 없습니다.")
+            occupied = connection.execute(
+                """
+                SELECT COALESCE(MAX(slot_index), 0) AS max_slot
+                FROM equipment
+                WHERE deleted = 0
+                  AND parent_equipment_id = ?
+                """,
+                (frame_db_id,),
+            ).fetchone()
+            max_slot = int(occupied["max_slot"] or 0)
+            if max_slot > count:
+                raise ValueError(
+                    f"슬롯 {max_slot}까지 카드가 장착되어 있습니다. "
+                    f"먼저 슬롯 {count + 1} 이상을 분리한 뒤 줄여주세요."
+                )
+            connection.execute(
+                """
+                UPDATE equipment
+                SET frame_slot_count = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND deleted = 0
+                """,
+                (count, frame_db_id),
+            )
+        updated = self.get(frame_db_id)
+        if updated is None:
+            raise RuntimeError("슬롯 수를 저장하지 못했습니다.")
+        return updated
+
+    def mount_module_card(
+        self,
+        parent_db_id: int,
+        *,
+        slot_index: int,
+        spec_key: str,
+        equipment_name: str = "",
+    ) -> EquipmentRecord:
+        """MODULE FRAME 슬롯에 모듈 카드를 생성·장착한다."""
+        slot = int(slot_index)
+        if slot < 1:
+            raise ValueError("슬롯 번호가 올바르지 않습니다.")
+        parent = self.get(parent_db_id)
+        if parent is None:
+            raise ValueError("프레임 장비를 찾을 수 없습니다.")
+        if parent.parent_equipment_id is not None:
+            raise ValueError("카드에는 다른 카드를 장착할 수 없습니다.")
+        slot_count = self.frame_slot_count_for(parent)
+        if slot_count <= 0:
+            raise ValueError("이 장비에는 슬롯이 없습니다.")
+        if slot > slot_count:
+            raise ValueError(f"슬롯 번호는 1~{slot_count} 사이여야 합니다.")
+
+        with self._connection() as connection:
+            type_row = connection.execute(
+                """
+                SELECT *
+                FROM equipment_types
+                WHERE spec_key = ? AND active = 1
+                """,
+                (spec_key,),
+            ).fetchone()
+            if type_row is None:
+                raise ValueError("알 수 없는 카드 종류입니다.")
+            if str(type_row["category_key"]) != "module_card":
+                raise ValueError("모듈 카드 종류만 장착할 수 있습니다.")
+            occupied = connection.execute(
+                """
+                SELECT 1
+                FROM equipment
+                WHERE deleted = 0
+                  AND parent_equipment_id = ?
+                  AND slot_index = ?
+                """,
+                (parent_db_id, slot),
+            ).fetchone()
+            if occupied is not None:
+                raise ValueError(f"슬롯 {slot}에 이미 카드가 있습니다.")
+
+            pending_id = f"PENDING-{uuid.uuid4().hex}"
+            name = (equipment_name or str(type_row["name"])).strip()
+            cursor = connection.execute(
+                """
+                INSERT INTO equipment (
+                    equipment_id, spec_key, equipment_name,
+                    world_x, world_y, layout_width, layout_height, locked,
+                    parent_equipment_id, slot_index
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+                """,
+                (
+                    pending_id,
+                    spec_key,
+                    name,
+                    float(parent.world_x),
+                    float(parent.world_y),
+                    float(type_row["width"]),
+                    float(type_row["height"]),
+                    parent_db_id,
+                    slot,
+                ),
+            )
+            db_id = int(cursor.lastrowid)
+            equipment_id = self._next_equipment_id(
+                connection,
+                str(type_row["id_prefix"]),
+            )
+            connection.execute(
+                "UPDATE equipment SET equipment_id = ? WHERE id = ?",
+                (equipment_id, db_id),
+            )
+            row = connection.execute(
+                "SELECT * FROM equipment WHERE id = ?",
+                (db_id,),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("장착한 카드 정보를 DB에서 찾을 수 없습니다.")
+        return self._to_record(row)
+
+    def unmount_module_card(
+        self,
+        parent_db_id: int,
+        slot_index: int,
+    ) -> None:
+        """슬롯의 카드를 분리(소프트 삭제)한다."""
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE equipment
+                SET deleted = 1, updated_at = CURRENT_TIMESTAMP
+                WHERE deleted = 0
+                  AND parent_equipment_id = ?
+                  AND slot_index = ?
+                """,
+                (parent_db_id, int(slot_index)),
+            )
+            if cursor.rowcount <= 0:
+                raise ValueError("해당 슬롯에 카드가 없습니다.")
 
     def list_equipment_types(self, *, active_only: bool = True) -> list[EquipmentTypeRecord]:
         query = "SELECT * FROM equipment_types"
@@ -1310,8 +1633,9 @@ class EquipmentRepository:
                 UPDATE equipment
                 SET deleted = 1, updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
+                   OR parent_equipment_id = ?
                 """,
-                (db_id,),
+                (db_id, db_id),
             )
 
     def restore(self, db_id: int) -> EquipmentRecord | None:
@@ -1409,8 +1733,13 @@ class EquipmentRepository:
             ).fetchone()
             if source is None:
                 raise ValueError("장비 종류를 찾을 수 없습니다.")
-            if str(source["category_key"]) != "broadcast_equipment":
-                raise ValueError("방송 장비의 연결 정보만 수정할 수 있습니다.")
+            if str(source["category_key"]) not in {
+                "broadcast_equipment",
+                "module_card",
+            }:
+                raise ValueError(
+                    "방송 장비/모듈 카드의 연결 정보만 수정할 수 있습니다."
+                )
 
             rows = connection.execute(
                 """
@@ -1549,33 +1878,197 @@ class EquipmentRepository:
             ).fetchall()
         return [self._to_connection_record(row) for row in rows]
 
+    def next_empty_slot(self, parent_db_id: int) -> int:
+        parent = self.get(parent_db_id)
+        if parent is None:
+            raise ValueError("프레임 장비를 찾을 수 없습니다.")
+        if parent.parent_equipment_id is not None:
+            raise ValueError("카드에는 슬롯이 없습니다.")
+        slot_count = self.frame_slot_count_for(parent)
+        if slot_count <= 0:
+            raise ValueError("이 장비에는 슬롯이 없습니다.")
+        occupied = {
+            child.slot_index
+            for child in self.list_child_equipment(parent_db_id)
+            if child.slot_index is not None
+        }
+        for index in range(1, slot_count + 1):
+            if index not in occupied:
+                return index
+        raise ValueError(
+            "빈 슬롯이 없습니다. 슬롯 수를 늘리거나 카드를 분리하세요."
+        )
+
     def clone_equipment(
         self,
         source_db_id: int,
         *,
         offset_x: float = 0.0,
         offset_y: float = 0.0,
+        parent_db_id: int | None = None,
+        slot_index: int | None = None,
     ) -> EquipmentRecord:
-        """장비 정보를 복제하고 새 장비 ID만 발급한다."""
+        """장비 정보를 복제하고 새 장비 ID만 발급한다.
+
+        장착된 모듈 카드는 대상 프레임의 빈 슬롯(또는 지정 슬롯)에 복제한다.
+        """
+        source = self.get(source_db_id)
+        if source is None:
+            raise ValueError("복사할 장비를 찾을 수 없습니다.")
+        if source.parent_equipment_id is not None:
+            target_parent_id = (
+                int(parent_db_id)
+                if parent_db_id is not None
+                else int(source.parent_equipment_id)
+            )
+            target_slot = (
+                int(slot_index)
+                if slot_index is not None
+                else self.next_empty_slot(target_parent_id)
+            )
+            return self._clone_module_card(
+                source,
+                parent_db_id=target_parent_id,
+                slot_index=target_slot,
+            )
+        return self._clone_top_level_equipment(
+            source,
+            offset_x=offset_x,
+            offset_y=offset_y,
+        )
+
+    def _clone_module_card(
+        self,
+        source: EquipmentRecord,
+        *,
+        parent_db_id: int,
+        slot_index: int,
+    ) -> EquipmentRecord:
+        parent = self.get(parent_db_id)
+        if parent is None:
+            raise ValueError("붙여넣을 프레임 장비를 찾을 수 없습니다.")
+        if parent.parent_equipment_id is not None:
+            raise ValueError("카드에는 다른 카드를 붙여넣을 수 없습니다.")
+        slot = int(slot_index)
+        slot_count = self.frame_slot_count_for(parent)
+        if slot < 1 or slot > slot_count:
+            raise ValueError(f"슬롯 번호는 1~{slot_count} 사이여야 합니다.")
+        occupied = {
+            child.slot_index
+            for child in self.list_child_equipment(parent_db_id)
+            if child.slot_index is not None
+        }
+        if slot in occupied:
+            raise ValueError(f"슬롯 {slot}에 이미 카드가 있습니다.")
+
         pending_id = f"PENDING-{uuid.uuid4().hex}"
         with self._connection() as connection:
-            source = connection.execute(
+            type_row = connection.execute(
                 """
-                SELECT *
-                FROM equipment
-                WHERE id = ? AND deleted = 0
+                SELECT id_prefix, width, height, category_key
+                FROM equipment_types
+                WHERE spec_key = ? AND active = 1
                 """,
-                (source_db_id,),
+                (source.spec_key,),
             ).fetchone()
-            if source is None:
-                raise ValueError("복사할 장비를 찾을 수 없습니다.")
+            if type_row is None:
+                raise ValueError("알 수 없는 장비 종류입니다.")
+            if str(type_row["category_key"]) != "module_card":
+                raise ValueError("모듈 카드만 슬롯에 복제할 수 있습니다.")
+
+            cursor = connection.execute(
+                """
+                INSERT INTO equipment (
+                    equipment_id, spec_key, equipment_name,
+                    equipment_vendor, equipment_model,
+                    asset_number, serial_number,
+                    photo_path, photo_source_url, photo_query,
+                    world_x, world_y, layout_width, layout_height,
+                    locked, parent_equipment_id, slot_index
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, 0, ?, ?)
+                """,
+                (
+                    pending_id,
+                    source.spec_key,
+                    source.equipment_name,
+                    source.equipment_vendor,
+                    source.equipment_model,
+                    source.asset_number,
+                    source.serial_number,
+                    source.photo_source_url,
+                    source.photo_query,
+                    float(parent.world_x),
+                    float(parent.world_y),
+                    float(source.layout_width or type_row["width"]),
+                    float(source.layout_height or type_row["height"]),
+                    parent_db_id,
+                    slot,
+                ),
+            )
+            target_db_id = int(cursor.lastrowid)
+            equipment_id = self._next_equipment_id(
+                connection,
+                str(type_row["id_prefix"]),
+            )
+            connection.execute(
+                "UPDATE equipment SET equipment_id = ? WHERE id = ?",
+                (equipment_id, target_db_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO equipment_connections (
+                    equipment_id, interface_type, port_index,
+                    connection_name, created_at, updated_at
+                )
+                SELECT ?, interface_type, port_index,
+                       connection_name, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                FROM equipment_connections
+                WHERE equipment_id = ?
+                ORDER BY id
+                """,
+                (target_db_id, source.db_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO equipment_logs (
+                    equipment_id, log_date, category, action,
+                    created_at, updated_at
+                )
+                SELECT ?, log_date, category, action,
+                       CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                FROM equipment_logs
+                WHERE equipment_id = ?
+                ORDER BY id
+                """,
+                (target_db_id, source.db_id),
+            )
+            row = connection.execute(
+                "SELECT * FROM equipment WHERE id = ?",
+                (target_db_id,),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("복제한 카드 정보를 DB에서 찾을 수 없습니다.")
+        return self._to_record(row)
+
+    def _clone_top_level_equipment(
+        self,
+        source: EquipmentRecord,
+        *,
+        offset_x: float = 0.0,
+        offset_y: float = 0.0,
+    ) -> EquipmentRecord:
+        """캔버스 상위 장비를 복제하고, 프레임이면 슬롯 카드도 함께 복제한다."""
+        pending_id = f"PENDING-{uuid.uuid4().hex}"
+        source_db_id = source.db_id
+        with self._connection() as connection:
             type_row = connection.execute(
                 """
                 SELECT id_prefix
                 FROM equipment_types
                 WHERE spec_key = ? AND active = 1
                 """,
-                (str(source["spec_key"]),),
+                (source.spec_key,),
             ).fetchone()
             if type_row is None:
                 raise ValueError("알 수 없는 장비 종류입니다.")
@@ -1587,26 +2080,28 @@ class EquipmentRepository:
                     equipment_vendor, equipment_model,
                     asset_number, serial_number,
                     photo_path, photo_source_url, photo_query,
-                    world_x, world_y, layout_width, layout_height, locked
+                    world_x, world_y, layout_width, layout_height, locked,
+                    frame_slot_count
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     pending_id,
-                    str(source["spec_key"]),
-                    str(source["equipment_name"]),
-                    str(source["equipment_vendor"]),
-                    str(source["equipment_model"]),
-                    str(source["asset_number"]),
-                    str(source["serial_number"]),
+                    source.spec_key,
+                    source.equipment_name,
+                    source.equipment_vendor,
+                    source.equipment_model,
+                    source.asset_number,
+                    source.serial_number,
                     "",
-                    str(source["photo_source_url"]),
-                    str(source["photo_query"]),
-                    float(source["world_x"]) + float(offset_x),
-                    float(source["world_y"]) + float(offset_y),
-                    float(source["layout_width"]),
-                    float(source["layout_height"]),
-                    int(source["locked"]),
+                    source.photo_source_url,
+                    source.photo_query,
+                    float(source.world_x) + float(offset_x),
+                    float(source.world_y) + float(offset_y),
+                    float(source.layout_width),
+                    float(source.layout_height),
+                    int(source.locked),
+                    int(source.frame_slot_count or 0),
                 ),
             )
             target_db_id = int(cursor.lastrowid)
@@ -1646,6 +2141,95 @@ class EquipmentRepository:
                 """,
                 (target_db_id, source_db_id),
             )
+            children = connection.execute(
+                """
+                SELECT *
+                FROM equipment
+                WHERE deleted = 0
+                  AND parent_equipment_id = ?
+                ORDER BY slot_index, id
+                """,
+                (source_db_id,),
+            ).fetchall()
+            for child in children:
+                child_type = connection.execute(
+                    """
+                    SELECT id_prefix, width, height
+                    FROM equipment_types
+                    WHERE spec_key = ? AND active = 1
+                    """,
+                    (str(child["spec_key"]),),
+                ).fetchone()
+                if child_type is None:
+                    continue
+                child_pending = f"PENDING-{uuid.uuid4().hex}"
+                child_cursor = connection.execute(
+                    """
+                    INSERT INTO equipment (
+                        equipment_id, spec_key, equipment_name,
+                        equipment_vendor, equipment_model,
+                        asset_number, serial_number,
+                        photo_path, photo_source_url, photo_query,
+                        world_x, world_y, layout_width, layout_height,
+                        locked, parent_equipment_id, slot_index
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, 0, ?, ?)
+                    """,
+                    (
+                        child_pending,
+                        str(child["spec_key"]),
+                        str(child["equipment_name"]),
+                        str(child["equipment_vendor"]),
+                        str(child["equipment_model"]),
+                        str(child["asset_number"]),
+                        str(child["serial_number"]),
+                        str(child["photo_source_url"]),
+                        str(child["photo_query"]),
+                        float(source.world_x) + float(offset_x),
+                        float(source.world_y) + float(offset_y),
+                        float(child["layout_width"] or child_type["width"]),
+                        float(child["layout_height"] or child_type["height"]),
+                        target_db_id,
+                        int(child["slot_index"]),
+                    ),
+                )
+                child_db_id = int(child_cursor.lastrowid)
+                child_equipment_id = self._next_equipment_id(
+                    connection,
+                    str(child_type["id_prefix"]),
+                )
+                connection.execute(
+                    "UPDATE equipment SET equipment_id = ? WHERE id = ?",
+                    (child_equipment_id, child_db_id),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO equipment_connections (
+                        equipment_id, interface_type, port_index,
+                        connection_name, created_at, updated_at
+                    )
+                    SELECT ?, interface_type, port_index,
+                           connection_name, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                    FROM equipment_connections
+                    WHERE equipment_id = ?
+                    ORDER BY id
+                    """,
+                    (child_db_id, int(child["id"])),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO equipment_logs (
+                        equipment_id, log_date, category, action,
+                        created_at, updated_at
+                    )
+                    SELECT ?, log_date, category, action,
+                           CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                    FROM equipment_logs
+                    WHERE equipment_id = ?
+                    ORDER BY id
+                    """,
+                    (child_db_id, int(child["id"])),
+                )
             row = connection.execute(
                 "SELECT * FROM equipment WHERE id = ?",
                 (target_db_id,),
@@ -1962,6 +2546,9 @@ class EquipmentRepository:
 
     @staticmethod
     def _to_record(row: sqlite3.Row) -> EquipmentRecord:
+        keys = set(row.keys())
+        parent_raw = row["parent_equipment_id"] if "parent_equipment_id" in keys else None
+        slot_raw = row["slot_index"] if "slot_index" in keys else None
         return EquipmentRecord(
             db_id=int(row["id"]),
             equipment_id=str(row["equipment_id"]),
@@ -1979,10 +2566,25 @@ class EquipmentRepository:
             layout_width=float(row["layout_width"]),
             layout_height=float(row["layout_height"]),
             locked=bool(row["locked"]),
+            parent_equipment_id=(
+                int(parent_raw) if parent_raw is not None else None
+            ),
+            slot_index=int(slot_raw) if slot_raw is not None else None,
+            frame_slot_count=(
+                int(row["frame_slot_count"])
+                if "frame_slot_count" in keys and row["frame_slot_count"] is not None
+                else 0
+            ),
         )
 
     @staticmethod
     def _to_type_record(row: sqlite3.Row) -> EquipmentTypeRecord:
+        keys = set(row.keys())
+        frame_slots = (
+            int(row["frame_slot_count"])
+            if "frame_slot_count" in keys and row["frame_slot_count"] is not None
+            else 0
+        )
         return EquipmentTypeRecord(
             key=str(row["spec_key"]),
             category_key=str(row["category_key"]),
@@ -1998,6 +2600,7 @@ class EquipmentRepository:
             sort_order=int(row["sort_order"]),
             id_prefix=str(row["id_prefix"]),
             is_half=bool(row["is_half"]),
+            frame_slot_count=frame_slots,
         )
 
     @staticmethod

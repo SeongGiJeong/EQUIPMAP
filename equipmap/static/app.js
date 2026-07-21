@@ -48,6 +48,7 @@ const state = {
   typeByKey: new Map(),
   items: [],
   selected: new Set(),
+  selectionOrder: [],
   zoom: 1,
   offsetX: 0,
   offsetY: 0,
@@ -67,6 +68,10 @@ const state = {
   cableMode: false,
   links: [],
   portMenuItemId: null,
+  pathTrace: null,
+  pathBlinkOn: true,
+  pathFlowPhase: 0,
+  pathBlinkTimer: null,
 };
 
 function escapeHtml(value) {
@@ -124,6 +129,12 @@ function instanceRu(item, fallbackSpec = null) {
 
 function selectedItems() {
   return state.items.filter((item) => state.selected.has(item.db_id));
+}
+
+function selectedItemsOrdered() {
+  return state.selectionOrder
+    .map((id) => state.items.find((item) => item.db_id === id))
+    .filter(Boolean);
 }
 
 function geometrySnapshot(item) {
@@ -197,9 +208,38 @@ function itemBox(item) {
   };
 }
 
+function isCanvasItem(item) {
+  return !item?.parent_equipment_id;
+}
+
+function canvasItems() {
+  return state.items.filter(isCanvasItem);
+}
+
+function isModuleFrame(item) {
+  const spec = specFor(item);
+  return Boolean(
+    spec
+    && (spec.id_prefix === "MODULE_FRAME" || Number(spec.frame_slot_count) > 0),
+  );
+}
+
+function moduleCardTypes() {
+  return state.types.filter((spec) => spec.category_key === "module_card");
+}
+
+function cableAnchorItem(item) {
+  if (!item?.parent_equipment_id) return item;
+  return (
+    state.items.find((entry) => entry.db_id === item.parent_equipment_id)
+    || item
+  );
+}
+
 function hitTest(x, y) {
-  for (let index = state.items.length - 1; index >= 0; index -= 1) {
-    const item = state.items[index];
+  const items = canvasItems();
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index];
     const box = itemBox(item);
     if (x >= box.x0 && x <= box.x1 && y >= box.y0 && y <= box.y1) {
       return item;
@@ -634,7 +674,7 @@ function drawBroadcastDevice(item, box) {
 }
 
 function drawEquipment() {
-  for (const item of state.items) {
+  for (const item of canvasItems()) {
     const box = itemBox(item);
     if (isRackKey(item.spec_key)) drawRack(item, box);
     else if (item.spec_key.startsWith("broadcast_")) {
@@ -647,14 +687,115 @@ function drawEquipment() {
   }
 }
 
+function drawFlowArrowHead(x, y, ux, uy, size) {
+  const px = -uy;
+  const py = ux;
+  ctx.beginPath();
+  ctx.moveTo(x + ux * size, y + uy * size);
+  ctx.lineTo(x - ux * size * 0.6 + px * size * 0.7, y - uy * size * 0.6 + py * size * 0.7);
+  ctx.lineTo(x - ux * size * 0.6 - px * size * 0.7, y - uy * size * 0.6 - py * size * 0.7);
+  ctx.closePath();
+  ctx.fill();
+}
+
+function drawDirectedPathCable(fromPt, toPt, phase) {
+  const dx = toPt.x - fromPt.x;
+  const dy = toPt.y - fromPt.y;
+  const len = Math.hypot(dx, dy) || 1;
+  const ux = dx / len;
+  const uy = dy / len;
+  const blink = state.pathBlinkOn;
+
+  ctx.save();
+  ctx.lineCap = "round";
+  ctx.strokeStyle = blink ? "#dc2626" : "#f87171";
+  ctx.lineWidth = Math.max(2.6, state.zoom * 2.6);
+  ctx.shadowColor = blink ? "rgba(220, 38, 38, 0.5)" : "transparent";
+  ctx.shadowBlur = blink ? 8 : 0;
+  ctx.setLineDash([12, 10]);
+  ctx.lineDashOffset = -phase;
+  ctx.beginPath();
+  ctx.moveTo(fromPt.x, fromPt.y);
+  ctx.lineTo(toPt.x, toPt.y);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.shadowBlur = 0;
+
+  ctx.fillStyle = blink ? "#b91c1c" : "#ef4444";
+  const spacing = Math.max(28, 34 * state.zoom);
+  const arrowSize = Math.max(5, 6.5 * state.zoom);
+  const offset = phase % spacing;
+  for (let distance = offset; distance < len - arrowSize; distance += spacing) {
+    drawFlowArrowHead(
+      fromPt.x + ux * distance,
+      fromPt.y + uy * distance,
+      ux,
+      uy,
+      arrowSize,
+    );
+  }
+  // 끝점 화살표
+  drawFlowArrowHead(
+    toPt.x - ux * arrowSize * 0.2,
+    toPt.y - uy * arrowSize * 0.2,
+    ux,
+    uy,
+    arrowSize * 1.15,
+  );
+  ctx.restore();
+}
+
 function drawSelection() {
   ctx.save();
-  ctx.setLineDash([5, 3]);
-  for (const item of selectedItems()) {
-    const box = itemBox(item);
-    ctx.strokeStyle = item.locked ? "#7f8c8d" : "#2f6fed";
-    ctx.lineWidth = 1.5;
+  const pathActive = Boolean(state.pathTrace);
+  const pathEquip = new Set(state.pathTrace?.equipmentIds || []);
+  const ordered = selectedItemsOrdered();
+
+  for (const item of ordered) {
+    const visual = cableAnchorItem(item);
+    if (!visual || !isCanvasItem(visual)) continue;
+    const box = itemBox(visual);
+    const isCard = Boolean(item.parent_equipment_id);
+    if (pathActive) {
+      ctx.setLineDash([5, 3]);
+      ctx.strokeStyle = state.pathBlinkOn ? "#dc2626" : "#fca5a5";
+      ctx.lineWidth = 2.6;
+    } else {
+      ctx.setLineDash([5, 3]);
+      ctx.strokeStyle = item.locked ? "#7f8c8d" : (isCard ? "#0f766e" : "#2f6fed");
+      ctx.lineWidth = 1.5;
+    }
     ctx.strokeRect(box.x0 - 4, box.y0 - 4, box.width + 8, box.height + 8);
+
+    if (pathActive && ordered.length === 2) {
+      const orderIndex = ordered.findIndex((entry) => entry.db_id === item.db_id);
+      const label = orderIndex === 0 ? "1" : "2";
+      const badge = Math.max(12, 14 * state.zoom);
+      ctx.setLineDash([]);
+      ctx.fillStyle = state.pathBlinkOn ? "#dc2626" : "#f87171";
+      ctx.beginPath();
+      ctx.arc(box.x0 - 2, box.y0 - 2, badge / 2, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = "#fff";
+      ctx.font = `bold ${Math.max(9, 10 * state.zoom)}px "Segoe UI", sans-serif`;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(label, box.x0 - 2, box.y0 - 2);
+    }
+  }
+
+  if (pathEquip.size) {
+    ctx.setLineDash([4, 3]);
+    ctx.strokeStyle = state.pathBlinkOn ? "#dc2626" : "#fca5a5";
+    ctx.lineWidth = 2;
+    for (const dbId of pathEquip) {
+      if (state.selected.has(dbId)) continue;
+      const item = state.items.find((entry) => entry.db_id === dbId);
+      const visual = cableAnchorItem(item);
+      if (!visual || !isCanvasItem(visual)) continue;
+      const box = itemBox(visual);
+      ctx.strokeRect(box.x0 - 6, box.y0 - 6, box.width + 12, box.height + 12);
+    }
   }
   ctx.restore();
 }
@@ -689,31 +830,37 @@ function edgeAnchor(box, targetX, targetY) {
 }
 
 function drawCables() {
-  if (!state.links.length) return;
+  // 평소에는 숨기고, 장비 2개 선택으로 신호 흐름이 잡힐 때만 경로 케이블 표시
+  const hops = state.pathTrace?.hops;
+  if (!hops?.length || !state.links.length) return;
+  const pathLinkIds = new Set(hops.map((hop) => hop.linkId));
   const byId = new Map(state.items.map((item) => [item.db_id, item]));
   const pairOffset = new Map();
   for (const link of state.links) {
-    const key = [link.a_equipment_db_id, link.b_equipment_db_id]
-      .sort((a, b) => a - b)
-      .join("-");
+    if (!pathLinkIds.has(link.link_id)) continue;
+    const aItem = cableAnchorItem(byId.get(link.a_equipment_db_id));
+    const bItem = cableAnchorItem(byId.get(link.b_equipment_db_id));
+    if (!aItem || !bItem) continue;
+    const key = [aItem.db_id, bItem.db_id].sort((a, b) => a - b).join("-");
     pairOffset.set(key, (pairOffset.get(key) || 0) + 1);
   }
   const pairSeen = new Map();
   const gap = Math.max(5, 8 * state.zoom);
   ctx.save();
-  ctx.lineWidth = Math.max(1.4, state.zoom * 1.6);
   ctx.lineCap = "round";
   for (const link of state.links) {
-    const a = byId.get(link.a_equipment_db_id);
-    const b = byId.get(link.b_equipment_db_id);
+    const hop = hops.find((entry) => entry.linkId === link.link_id);
+    if (!hop) continue;
+    const aRaw = byId.get(link.a_equipment_db_id);
+    const bRaw = byId.get(link.b_equipment_db_id);
+    const a = cableAnchorItem(aRaw);
+    const b = cableAnchorItem(bRaw);
     if (!a || !b) continue;
     const boxA = itemBox(a);
     const boxB = itemBox(b);
     const ca = { x: (boxA.x0 + boxA.x1) / 2, y: (boxA.y0 + boxA.y1) / 2 };
     const cb = { x: (boxB.x0 + boxB.x1) / 2, y: (boxB.y0 + boxB.y1) / 2 };
-    const key = [link.a_equipment_db_id, link.b_equipment_db_id]
-      .sort((n, m) => n - m)
-      .join("-");
+    const key = [a.db_id, b.db_id].sort((n, m) => n - m).join("-");
     const total = pairOffset.get(key) || 1;
     const seen = pairSeen.get(key) || 0;
     pairSeen.set(key, seen + 1);
@@ -729,18 +876,10 @@ function drawCables() {
     const pb = edgeAnchor(boxB, ca.x + ox, ca.y + oy);
     pa.x += ox; pa.y += oy;
     pb.x += ox; pb.y += oy;
-    ctx.strokeStyle = "#f59e0b";
-    ctx.beginPath();
-    ctx.moveTo(pa.x, pa.y);
-    ctx.lineTo(pb.x, pb.y);
-    ctx.stroke();
-    const dot = Math.max(2, state.zoom * 2.2);
-    ctx.fillStyle = "#d97706";
-    for (const point of [pa, pb]) {
-      ctx.beginPath();
-      ctx.arc(point.x, point.y, dot, 0, Math.PI * 2);
-      ctx.fill();
-    }
+    const fromIsA = hop.from.dbId === link.a_equipment_db_id;
+    const fromPt = fromIsA ? pa : pb;
+    const toPt = fromIsA ? pb : pa;
+    drawDirectedPathCable(fromPt, toPt, state.pathFlowPhase);
   }
   ctx.restore();
 }
@@ -759,6 +898,7 @@ function categoryOrderValue(key) {
     rack: 0,
     broadcast_equipment: 1,
     custom_equipment: 2,
+    module_card: 3,
   };
   return categoryOrder[key] ?? 999;
 }
@@ -766,6 +906,8 @@ function categoryOrderValue(key) {
 function sortedCategories() {
   const categories = new Map();
   for (const spec of state.types) {
+    // 모듈 카드는 팔레트 배치 대상이 아님 (프레임 슬롯에서만 장착)
+    if (spec.category_key === "module_card") continue;
     if (!categories.has(spec.category_key)) {
       categories.set(spec.category_key, []);
     }
@@ -1401,16 +1543,23 @@ function normalizeRackMountedItems() {
 }
 
 function setSelection(ids) {
-  state.selected = ids;
+  const idSet = ids instanceof Set ? ids : new Set(ids);
+  const nextOrder = state.selectionOrder.filter((id) => idSet.has(id));
+  for (const id of idSet) {
+    if (!nextOrder.includes(id)) nextOrder.push(id);
+  }
+  state.selectionOrder = nextOrder;
+  state.selected = idSet;
   state.inspectorEditing = false;
   state.connectionEditing = false;
   state.expandedInterfaceType = null;
   state.connectionNamesByType = {};
   hideContextMenu();
   hideTooltip();
+  const items = selectedItemsOrdered();
+  updatePathTrace(items);
   renderInspector();
   draw();
-  const items = selectedItems();
   if (state.linkDraft) {
     updateLinkDraftBanner();
     if (items.length === 1 && items[0].db_id !== state.linkDraft.db_id) {
@@ -1430,6 +1579,19 @@ function setSelection(ids) {
       `선택: ${specFor(items[0])?.name || items[0].spec_key}` +
       (items[0].locked ? " — 위치 고정됨" : " — 드래그·방향키 이동"),
     );
+  } else if (items.length === 2) {
+    const path = state.pathTrace;
+    if (path?.sameGroup) {
+      setStatus("선택: 같은 프레임/장비 그룹");
+    } else if (path?.hops?.length) {
+      setStatus(
+        `신호 흐름: ${path.fromName} → ${path.toName} (${path.hops.length}구간)`,
+      );
+    } else {
+      setStatus(
+        `선택: ${equipmentDisplayName(items[0])} → ${equipmentDisplayName(items[1])} — 연결 경로 없음`,
+      );
+    }
   } else {
     setStatus(`선택: ${items.length}개 장비`);
   }
@@ -1437,6 +1599,254 @@ function setSelection(ids) {
 
 function clearSelection() {
   setSelection(new Set());
+}
+
+function equipmentGroupIds(item) {
+  const ids = new Set([item.db_id]);
+  if (isModuleFrame(item)) {
+    for (const child of state.items) {
+      if (child.parent_equipment_id === item.db_id) ids.add(child.db_id);
+    }
+  }
+  return ids;
+}
+
+function equipmentDisplayName(item) {
+  if (!item) return "(알 수 없음)";
+  return item.equipment_name || specFor(item)?.name || item.equipment_id;
+}
+
+function buildLinkAdjacency() {
+  const adj = new Map();
+  for (const link of state.links) {
+    const a = link.a_equipment_db_id;
+    const b = link.b_equipment_db_id;
+    if (!adj.has(a)) adj.set(a, []);
+    if (!adj.has(b)) adj.set(b, []);
+    adj.get(a).push({ to: b, link, fromIsA: true });
+    adj.get(b).push({ to: a, link, fromIsA: false });
+  }
+  return adj;
+}
+
+function findConnectionPath(startItem, endItem) {
+  const starts = equipmentGroupIds(startItem);
+  const goals = equipmentGroupIds(endItem);
+  if ([...starts].some((id) => goals.has(id))) {
+    return { hops: [], linkIds: [], equipmentIds: [...starts], sameGroup: true };
+  }
+  const adj = buildLinkAdjacency();
+  const queue = [];
+  const visited = new Set();
+  const parent = new Map();
+  for (const id of starts) {
+    queue.push(id);
+    visited.add(id);
+    parent.set(id, null);
+  }
+  let found = null;
+  while (queue.length) {
+    const current = queue.shift();
+    if (goals.has(current)) {
+      found = current;
+      break;
+    }
+    for (const edge of adj.get(current) || []) {
+      if (visited.has(edge.to)) continue;
+      visited.add(edge.to);
+      parent.set(edge.to, { from: current, edge });
+      queue.push(edge.to);
+    }
+  }
+  if (found == null) return null;
+
+  const edges = [];
+  let cursor = found;
+  while (parent.get(cursor)) {
+    const step = parent.get(cursor);
+    edges.push(step.edge);
+    cursor = step.from;
+  }
+  edges.reverse();
+
+  const hops = [];
+  const linkIds = [];
+  const equipmentIds = new Set();
+  for (const edge of edges) {
+    const link = edge.link;
+    const fromIsA = edge.fromIsA;
+    const fromDbId = fromIsA ? link.a_equipment_db_id : link.b_equipment_db_id;
+    const toDbId = fromIsA ? link.b_equipment_db_id : link.a_equipment_db_id;
+    const fromItem = state.items.find((entry) => entry.db_id === fromDbId);
+    const toItem = state.items.find((entry) => entry.db_id === toDbId);
+    hops.push({
+      linkId: link.link_id,
+      from: {
+        dbId: fromDbId,
+        equipmentId: fromIsA ? link.a_equipment_id : link.b_equipment_id,
+        equipmentName: fromIsA ? link.a_equipment_name : link.b_equipment_name,
+        name: equipmentDisplayName(fromItem)
+          || (fromIsA ? link.a_equipment_name : link.b_equipment_name),
+        interfaceType: fromIsA ? link.a_interface_type : link.b_interface_type,
+        portIndex: fromIsA ? link.a_port_index : link.b_port_index,
+        connectionName: fromIsA ? link.a_connection_name : link.b_connection_name,
+      },
+      to: {
+        dbId: toDbId,
+        equipmentId: fromIsA ? link.b_equipment_id : link.a_equipment_id,
+        equipmentName: fromIsA ? link.b_equipment_name : link.a_equipment_name,
+        name: equipmentDisplayName(toItem)
+          || (fromIsA ? link.b_equipment_name : link.a_equipment_name),
+        interfaceType: fromIsA ? link.b_interface_type : link.a_interface_type,
+        portIndex: fromIsA ? link.b_port_index : link.a_port_index,
+        connectionName: fromIsA ? link.b_connection_name : link.a_connection_name,
+      },
+    });
+    linkIds.push(link.link_id);
+    equipmentIds.add(fromDbId);
+    equipmentIds.add(toDbId);
+  }
+  return {
+    hops,
+    linkIds,
+    equipmentIds: [...equipmentIds],
+    sameGroup: false,
+    fromName: equipmentDisplayName(startItem),
+    toName: equipmentDisplayName(endItem),
+  };
+}
+
+function stopPathBlink() {
+  if (state.pathBlinkTimer) {
+    clearInterval(state.pathBlinkTimer);
+    state.pathBlinkTimer = null;
+  }
+  state.pathBlinkOn = true;
+  state.pathFlowPhase = 0;
+}
+
+function startPathBlink() {
+  stopPathBlink();
+  const linkCount = state.pathTrace?.linkIds?.size || 0;
+  if (!linkCount) return;
+  let tick = 0;
+  state.pathBlinkTimer = setInterval(() => {
+    if (!state.pathTrace) {
+      stopPathBlink();
+      return;
+    }
+    tick += 1;
+    state.pathFlowPhase = (state.pathFlowPhase + 5) % 400;
+    if (tick % 3 === 0) state.pathBlinkOn = !state.pathBlinkOn;
+    draw();
+  }, 80);
+}
+
+function clearPathTrace() {
+  stopPathBlink();
+  state.pathTrace = null;
+}
+
+function updatePathTrace(items) {
+  clearPathTrace();
+  if (items.length !== 2) return;
+  if (!state.links.length) return;
+  const path = findConnectionPath(items[0], items[1]);
+  if (!path) {
+    state.pathTrace = {
+      hops: [],
+      linkIds: new Set(),
+      equipmentIds: [],
+      missing: true,
+      fromName: equipmentDisplayName(items[0]),
+      toName: equipmentDisplayName(items[1]),
+    };
+    return;
+  }
+  if (path.sameGroup) {
+    state.pathTrace = {
+      hops: [],
+      linkIds: new Set(),
+      equipmentIds: path.equipmentIds,
+      sameGroup: true,
+      fromName: path.fromName || equipmentDisplayName(items[0]),
+      toName: path.toName || equipmentDisplayName(items[1]),
+    };
+    return;
+  }
+  state.pathTrace = {
+    hops: path.hops,
+    linkIds: new Set(path.linkIds),
+    equipmentIds: path.equipmentIds,
+    fromName: path.fromName,
+    toName: path.toName,
+  };
+  startPathBlink();
+}
+
+function renderPathTraceHtml(path) {
+  if (!path) return "";
+  if (path.sameGroup) {
+    return `
+      <section class="info-section path-trace-section">
+        <h2>연결 경로</h2>
+        <p class="path-trace-empty">같은 프레임(또는 동일 장비 그룹)입니다.</p>
+      </section>
+    `;
+  }
+  if (path.missing || !path.hops?.length) {
+    return `
+      <section class="info-section path-trace-section">
+        <h2>신호 흐름</h2>
+        <p class="path-trace-empty">
+          <span class="path-endpoint start">1 시작</span>${escapeHtml(path.fromName)}
+          <span class="path-flow-sep">→</span>
+          <span class="path-endpoint end">2 도착</span>${escapeHtml(path.toName)}
+          사이에 케이블로 이어진 경로가 없습니다.
+        </p>
+      </section>
+    `;
+  }
+  return `
+    <section class="info-section path-trace-section">
+      <h2>신호 흐름</h2>
+      <p class="path-trace-summary">
+        <span class="path-endpoint start">1 시작</span>
+        ${escapeHtml(path.fromName)}
+        <span class="path-flow-sep">→</span>
+        <span class="path-endpoint end">2 도착</span>
+        ${escapeHtml(path.toName)}
+        · ${path.hops.length}구간
+      </p>
+      <ol class="path-trace-list">
+        ${path.hops.map((hop, index) => `
+          <li class="path-trace-hop">
+            <span class="path-trace-step">${index + 1}</span>
+            <div class="path-trace-body">
+              <div>
+                <strong>${escapeHtml(hop.from.name)}</strong>
+                <span class="path-trace-port">${escapeHtml(formatPortLabel(
+                  hop.from.interfaceType,
+                  hop.from.portIndex,
+                  hop.from.connectionName,
+                ))}</span>
+              </div>
+              <div class="path-trace-arrow">↓ 신호 흐름</div>
+              <div>
+                <strong>${escapeHtml(hop.to.name)}</strong>
+                <span class="path-trace-port">${escapeHtml(formatPortLabel(
+                  hop.to.interfaceType,
+                  hop.to.portIndex,
+                  hop.to.connectionName,
+                ))}</span>
+              </div>
+            </div>
+          </li>
+        `).join("")}
+      </ol>
+      <p class="path-trace-hint">캔버스: 1→2 방향으로 케이블 화살표가 흐르고, 선택 장비가 점멸합니다.</p>
+    </section>
+  `;
 }
 
 function interfaceTotals(spec) {
@@ -1635,8 +2045,15 @@ function interfaceEditorRowHtml(item = { interface_type: "", port_count: 1 }) {
   `;
 }
 
+function canEditConnections(spec) {
+  return (
+    spec?.category_key === "broadcast_equipment"
+    || spec?.category_key === "module_card"
+  );
+}
+
 function renderConnectionHtml(item, spec) {
-  const editable = spec?.category_key === "broadcast_equipment";
+  const editable = canEditConnections(spec);
   if (!state.connectionEditing || !editable) {
     return `
       ${state.linkDraft ? `
@@ -1968,8 +2385,232 @@ function bindConnectionPanel(item, editing) {
   });
 }
 
+function frameSlotsPlaceholderHtml() {
+  return `
+    <section class="info-section frame-slots-section">
+      <h2>슬롯 / 모듈 카드</h2>
+      <div id="frame-slots-panel">
+        <p class="connection-empty">슬롯 정보를 불러오는 중...</p>
+      </div>
+    </section>
+    <div class="info-divider"></div>
+  `;
+}
+
+function clipboardModuleCards() {
+  return state.clipboardIds
+    .map((id) => state.items.find((item) => item.db_id === id))
+    .filter((item) => item && item.parent_equipment_id);
+}
+
+function renderFrameSlotsHtml(frame, slotData) {
+  const cards = moduleCardTypes();
+  const options = cards.map((spec) => (
+    `<option value="${escapeHtml(spec.key)}">${escapeHtml(spec.name)}</option>`
+  )).join("");
+  const slotCount = Number(slotData?.slot_count) || 0;
+  const canPasteCard = clipboardModuleCards().length > 0;
+  if (!slotCount) {
+    return '<p class="connection-empty">이 장비에는 슬롯이 없습니다.</p>';
+  }
+  return `
+    <p class="frame-slots-help">
+      슬롯에 카드를 장착하면 방송장비처럼 포트·케이블·로그를 관리할 수 있습니다.
+      ${canPasteCard
+        ? " 복사된 카드는 원하는 빈 슬롯의 <strong>붙여넣기</strong>로 넣을 수 있습니다."
+        : ""}
+    </p>
+    <div class="frame-slot-count-row">
+      <label for="frame-slot-count-input">슬롯 수</label>
+      <input id="frame-slot-count-input" type="number" min="1" max="64"
+             value="${slotCount}" aria-label="슬롯 수">
+      <button type="button" id="save-frame-slot-count" class="primary">적용</button>
+    </div>
+    <p id="frame-slot-count-error" class="form-error" role="alert"></p>
+    <ul class="frame-slot-list">
+      ${(slotData.slots || []).map((slot) => {
+        const card = slot.card;
+        if (card) {
+          const cardSpec = specFor(card) || state.typeByKey.get(card.spec_key);
+          return `
+            <li class="frame-slot-row is-filled">
+              <span class="frame-slot-index">S${slot.slot_index}</span>
+              <button type="button" class="frame-slot-select"
+                      data-card-db-id="${card.db_id}">
+                <strong>${escapeHtml(card.equipment_name || cardSpec?.name || "카드")}</strong>
+                <span>${escapeHtml(card.equipment_id)}</span>
+              </button>
+              <div class="frame-slot-actions">
+                <button type="button" class="frame-slot-copy"
+                        data-card-db-id="${card.db_id}">복사</button>
+                <button type="button" class="frame-slot-unmount"
+                        data-slot-index="${slot.slot_index}">분리</button>
+              </div>
+            </li>
+          `;
+        }
+        return `
+          <li class="frame-slot-row${canPasteCard ? " can-paste" : ""}">
+            <span class="frame-slot-index">S${slot.slot_index}</span>
+            <select class="frame-slot-type" data-slot-index="${slot.slot_index}"
+                    aria-label="슬롯 ${slot.slot_index} 카드 종류">
+              <option value="">카드 선택</option>
+              ${options}
+            </select>
+            <div class="frame-slot-actions">
+              ${canPasteCard ? `
+                <button type="button" class="frame-slot-paste primary"
+                        data-slot-index="${slot.slot_index}">붙여넣기</button>
+              ` : ""}
+              <button type="button" class="frame-slot-mount"
+                      data-slot-index="${slot.slot_index}">장착</button>
+            </div>
+          </li>
+        `;
+      }).join("")}
+    </ul>
+  `;
+}
+
+async function loadFrameSlots(frame) {
+  const panel = document.getElementById("frame-slots-panel");
+  if (!panel) return;
+  try {
+    const slotData = await api(`/api/equipment/${frame.db_id}/slots`);
+    for (const slot of slotData.slots || []) {
+      if (!slot.card) continue;
+      const existing = state.items.find((entry) => entry.db_id === slot.card.db_id);
+      if (existing) Object.assign(existing, slot.card);
+      else state.items.push(slot.card);
+    }
+    panel.innerHTML = renderFrameSlotsHtml(frame, slotData);
+    bindFrameSlots(frame);
+  } catch (error) {
+    panel.innerHTML = `<p class="connection-empty">${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function bindFrameSlots(frame) {
+  document.getElementById("save-frame-slot-count")?.addEventListener("click", async () => {
+    const input = document.getElementById("frame-slot-count-input");
+    const errorEl = document.getElementById("frame-slot-count-error");
+    if (errorEl) errorEl.textContent = "";
+    const slotCount = Number(input?.value);
+    if (!Number.isInteger(slotCount) || slotCount < 1 || slotCount > 64) {
+      if (errorEl) errorEl.textContent = "슬롯 수는 1~64 사이 정수여야 합니다.";
+      return;
+    }
+    const button = document.getElementById("save-frame-slot-count");
+    if (button) button.disabled = true;
+    try {
+      const result = await api(`/api/equipment/${frame.db_id}/slots`, {
+        method: "PUT",
+        body: JSON.stringify({ slot_count: slotCount }),
+      });
+      Object.assign(frame, result.frame);
+      await loadFrameSlots(frame);
+      setStatus(`슬롯 수를 ${result.slot_count}개로 변경했습니다.`);
+    } catch (error) {
+      if (errorEl) errorEl.textContent = error.message;
+      setStatus(`슬롯 수 변경 실패: ${error.message}`);
+    } finally {
+      if (button) button.disabled = false;
+    }
+  });
+  document.querySelectorAll(".frame-slot-paste").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const slotIndex = Number(button.dataset.slotIndex);
+      button.disabled = true;
+      try {
+        await pasteModuleCardIntoSlot(frame, slotIndex);
+      } finally {
+        button.disabled = false;
+      }
+    });
+  });
+  document.querySelectorAll(".frame-slot-mount").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const slotIndex = Number(button.dataset.slotIndex);
+      const select = document.querySelector(
+        `.frame-slot-type[data-slot-index="${slotIndex}"]`,
+      );
+      const specKey = select?.value;
+      if (!specKey) {
+        setStatus("장착할 카드 종류를 선택하세요.");
+        return;
+      }
+      button.disabled = true;
+      try {
+        const card = await api(
+          `/api/equipment/${frame.db_id}/slots/${slotIndex}/mount`,
+          {
+            method: "POST",
+            body: JSON.stringify({ spec_key: specKey }),
+          },
+        );
+        state.items.push(card);
+        await loadFrameSlots(frame);
+        setStatus(`슬롯 ${slotIndex}에 ${card.equipment_name}을(를) 장착했습니다.`);
+      } catch (error) {
+        setStatus(`장착 실패: ${error.message}`);
+      } finally {
+        button.disabled = false;
+      }
+    });
+  });
+  document.querySelectorAll(".frame-slot-unmount").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const slotIndex = Number(button.dataset.slotIndex);
+      if (!window.confirm(`슬롯 ${slotIndex} 카드를 분리할까요?`)) return;
+      button.disabled = true;
+      try {
+        await api(
+          `/api/equipment/${frame.db_id}/slots/${slotIndex}`,
+          { method: "DELETE" },
+        );
+        state.items = state.items.filter(
+          (entry) => !(
+            entry.parent_equipment_id === frame.db_id
+            && entry.slot_index === slotIndex
+          ),
+        );
+        await loadAllLinks();
+        await loadFrameSlots(frame);
+        setStatus(`슬롯 ${slotIndex} 카드를 분리했습니다.`);
+      } catch (error) {
+        setStatus(`분리 실패: ${error.message}`);
+      } finally {
+        button.disabled = false;
+      }
+    });
+  });
+  document.querySelectorAll(".frame-slot-copy").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const cardId = Number(button.dataset.cardDbId);
+      const card = state.items.find((entry) => entry.db_id === cardId);
+      if (!card) return;
+      state.clipboardIds = [card.db_id];
+      setStatus(
+        `${card.equipment_name || "카드"}을(를) 복사했습니다. 원하는 빈 슬롯의 붙여넣기를 누르세요.`,
+      );
+      await loadFrameSlots(frame);
+    });
+  });
+  document.querySelectorAll(".frame-slot-select").forEach((button) => {
+    button.addEventListener("click", () => {
+      const cardId = Number(button.dataset.cardDbId);
+      const card = state.items.find((entry) => entry.db_id === cardId);
+      if (!card) return;
+      setSelection(new Set([card.db_id]));
+      setStatus(
+        `카드 선택: ${card.equipment_name || specFor(card)?.name} (슬롯 ${card.slot_index})`,
+      );
+    });
+  });
+}
+
 function renderInspector(editing = state.inspectorEditing) {
-  const items = selectedItems();
+  const items = selectedItemsOrdered();
   if (!items.length) {
     inspector.textContent = "캔버스에서 장비를 선택하면 정보가 표시됩니다.";
     return;
@@ -1981,11 +2622,16 @@ function renderInspector(editing = state.inspectorEditing) {
       const name = specFor(item)?.name || item.spec_key;
       counts.set(name, (counts.get(name) || 0) + 1);
     }
+    const pathHtml = items.length === 2
+      ? renderPathTraceHtml(state.pathTrace)
+      : `<p class="path-trace-hint">장비를 2개만 선택하면 신호 흐름을 표시합니다. (먼저 선택 = 시작, 나중 선택 = 도착)</p>`;
     inspector.innerHTML = `
       <div class="info-row"><span class="info-label">선택 장비</span><span class="info-value">${items.length}개</span></div>
       <div class="info-row"><span class="info-label">구성</span><span class="info-value">${[...counts].map(([name, count]) => `${escapeHtml(name)} × ${count}`).join("<br>")}</span></div>
       <div class="info-row"><span class="info-label">고정</span><span class="info-value">${locked}개</span></div>
       <div class="info-row"><span class="info-label">이동 가능</span><span class="info-value">${items.length - locked}개</span></div>
+      <div class="info-divider"></div>
+      ${pathHtml}
     `;
     return;
   }
@@ -2036,9 +2682,23 @@ function renderInspector(editing = state.inspectorEditing) {
         ? "저장된 모델 이미지가 없습니다."
         : "장비 모델명을 입력하면 이미지를 검색할 수 있습니다."}</p>`;
 
+  const parentFrame = item.parent_equipment_id
+    ? state.items.find((entry) => entry.db_id === item.parent_equipment_id)
+    : null;
+  const cardNavHtml = parentFrame
+    ? `
+      <div class="action-row">
+        <button type="button" id="back-to-frame">← 프레임으로</button>
+        <span class="frame-slot-badge">슬롯 ${item.slot_index || "-"}</span>
+      </div>
+    `
+    : "";
+  const slotsHtml = isModuleFrame(item) ? frameSlotsPlaceholderHtml() : "";
+
   inspector.innerHTML = `
     <section class="info-section">
       <h2>장비 정보</h2>
+      ${cardNavHtml}
       ${detailHtml}
       <div class="action-row">
         ${editing
@@ -2047,6 +2707,7 @@ function renderInspector(editing = state.inspectorEditing) {
       </div>
     </section>
     <div class="info-divider"></div>
+    ${slotsHtml}
     <section class="info-section connection-section">
       <h2>연결 정보</h2>
       <div id="connection-panel">
@@ -2117,6 +2778,10 @@ function renderInspector(editing = state.inspectorEditing) {
   });
   bindConnectionPanel(item, editing);
   loadEquipmentConnections(item);
+  if (isModuleFrame(item)) loadFrameSlots(item);
+  document.getElementById("back-to-frame")?.addEventListener("click", () => {
+    if (parentFrame) setSelection(new Set([parentFrame.db_id]));
+  });
   document.getElementById("search-photo")?.addEventListener("click", () => {
     searchEquipmentPhoto(item);
   });
@@ -2453,6 +3118,12 @@ async function deleteSelected() {
       items.map((item) => api(`/api/equipment/${item.db_id}`, { method: "DELETE" })),
     );
     const ids = new Set(items.map((item) => item.db_id));
+    // 프레임 삭제 시 서버가 자식 카드도 함께 소프트 삭제하므로 로컬에서도 제거
+    for (const item of items) {
+      for (const child of state.items) {
+        if (child.parent_equipment_id === item.db_id) ids.add(child.db_id);
+      }
+    }
     pushUndo({ type: "delete", dbIds: [...ids] });
     state.items = state.items.filter((item) => !ids.has(item.db_id));
     clearSelection();
@@ -2463,11 +3134,60 @@ async function deleteSelected() {
   }
 }
 
+function resolveCardPasteParentId(clipboardItems) {
+  const selected = selectedItems();
+  if (selected.length === 1) {
+    const current = selected[0];
+    if (current.parent_equipment_id) return current.parent_equipment_id;
+    if (isModuleFrame(current)) return current.db_id;
+  }
+  const sourceCard = clipboardItems.find((item) => item.parent_equipment_id);
+  return sourceCard?.parent_equipment_id || null;
+}
+
+async function pasteModuleCardIntoSlot(frame, slotIndex) {
+  const cards = clipboardModuleCards();
+  if (!cards.length) {
+    setStatus("먼저 모듈 카드를 복사하세요.");
+    return;
+  }
+  const source = cards[0];
+  try {
+    const pasted = await api("/api/equipment/clone", {
+      method: "POST",
+      body: JSON.stringify({
+        db_ids: [source.db_id],
+        parent_db_id: frame.db_id,
+        slot_index: slotIndex,
+      }),
+    });
+    for (const card of pasted) {
+      const existing = state.items.find((entry) => entry.db_id === card.db_id);
+      if (existing) Object.assign(existing, card);
+      else state.items.push(card);
+    }
+    await loadFrameSlots(frame);
+    if (pasted[0]) setSelection(new Set([pasted[0].db_id]));
+    setStatus(
+      `${source.equipment_name || "카드"}을(를) 슬롯 ${slotIndex}에 붙여넣었습니다.`,
+    );
+  } catch (error) {
+    setStatus(`붙여넣기 실패: ${error.message}`);
+  }
+}
+
 function copySelected() {
   const items = selectedItems();
   if (!items.length) return;
   state.clipboardIds = items.map((item) => item.db_id);
-  setStatus(`${items.length}개 장비를 복사했습니다. Ctrl+V로 붙여넣으세요.`);
+  const cardCount = items.filter((item) => item.parent_equipment_id).length;
+  if (cardCount && cardCount === items.length) {
+    setStatus(
+      `${cardCount}개 모듈 카드를 복사했습니다. 프레임에서 원하는 빈 슬롯의 붙여넣기를 누르세요.`,
+    );
+  } else {
+    setStatus(`${items.length}개 장비를 복사했습니다. Ctrl+V로 붙여넣으세요.`);
+  }
 }
 
 async function pasteEquipment() {
@@ -2476,44 +3196,103 @@ async function pasteEquipment() {
     return;
   }
   try {
-    const offset = 24 / state.zoom;
-    const pasted = await api("/api/equipment/clone", {
-      method: "POST",
-      body: JSON.stringify({
-        db_ids: state.clipboardIds,
-        offset_x: 0,
-        offset_y: 0,
-      }),
-    });
-    state.items.push(...pasted);
-    const includesRack = pasted.some(
-      (item) => isRackKey(item.spec_key),
-    );
-    for (const item of pasted) {
-      item.world_x += offset;
-      item.world_y += offset;
-      const spec = specFor(item);
-      if (isRackMountedSpec(spec) && !includesRack) {
-        const rack = nearestRack(item.world_x, item.world_y);
-        if (rack) {
-          const minimumOffset =
-            rackMetrics(rack).unitHeight * Math.max(1, instanceRu(item, spec));
-          item.world_y += Math.max(0, minimumOffset - offset);
+    const clipboardItems = state.clipboardIds
+      .map((id) => state.items.find((item) => item.db_id === id))
+      .filter(Boolean);
+    const cardIds = clipboardItems
+      .filter((item) => item.parent_equipment_id)
+      .map((item) => item.db_id);
+    const topIds = clipboardItems
+      .filter((item) => !item.parent_equipment_id)
+      .map((item) => item.db_id);
+    const pasted = [];
+
+    if (topIds.length) {
+      const offset = 24 / state.zoom;
+      const topPasted = await api("/api/equipment/clone", {
+        method: "POST",
+        body: JSON.stringify({
+          db_ids: topIds,
+          offset_x: 0,
+          offset_y: 0,
+        }),
+      });
+      state.items.push(...topPasted);
+      const includesRack = topPasted.some((item) => isRackKey(item.spec_key));
+      for (const item of topPasted) {
+        if (item.parent_equipment_id) continue;
+        item.world_x += offset;
+        item.world_y += offset;
+        const spec = specFor(item);
+        if (isRackMountedSpec(spec) && !includesRack) {
+          const rack = nearestRack(item.world_x, item.world_y);
+          if (rack) {
+            const minimumOffset =
+              rackMetrics(rack).unitHeight * Math.max(1, instanceRu(item, spec));
+            item.world_y += Math.max(0, minimumOffset - offset);
+          }
         }
       }
+      await Promise.all(
+        topPasted
+          .filter((item) => !item.parent_equipment_id)
+          .map((item) => {
+            if (isRackKey(item.spec_key)) snapRackItem(item);
+            else snapItemToRack(item);
+            return saveItem(item);
+          }),
+      );
+      pasted.push(...topPasted);
     }
-    await Promise.all(
-      pasted.map((item) => {
-        if (isRackKey(item.spec_key)) snapRackItem(item);
-        else snapItemToRack(item);
-        return saveItem(item);
-      }),
-    );
-    state.clipboardIds = pasted.map((item) => item.db_id);
-    setSelection(new Set(state.clipboardIds));
-    setStatus(
-      `${pasted.length}개 장비를 새 ID로 붙여넣었습니다.`,
-    );
+
+    if (cardIds.length) {
+      const parentDbId = resolveCardPasteParentId(clipboardItems);
+      if (!parentDbId) {
+        throw new Error(
+          "붙여넣을 MODULE FRAME을 선택한 뒤 다시 붙여넣으세요.",
+        );
+      }
+      const cardPasted = await api("/api/equipment/clone", {
+        method: "POST",
+        body: JSON.stringify({
+          db_ids: cardIds,
+          parent_db_id: parentDbId,
+        }),
+      });
+      for (const card of cardPasted) {
+        const existing = state.items.find((entry) => entry.db_id === card.db_id);
+        if (existing) Object.assign(existing, card);
+        else state.items.push(card);
+      }
+      pasted.push(...cardPasted);
+      const parent = state.items.find((entry) => entry.db_id === parentDbId);
+      if (parent && selectedItems()[0]?.db_id === parentDbId) {
+        await loadFrameSlots(parent);
+      }
+    }
+
+    const selectable = pasted.filter((item) => !item.parent_equipment_id);
+    const cardPastedOnly = pasted.filter((item) => item.parent_equipment_id);
+    if (selectable.length) {
+      state.clipboardIds = selectable.map((item) => item.db_id);
+      setSelection(new Set(state.clipboardIds));
+    } else if (cardPastedOnly.length) {
+      state.clipboardIds = cardIds;
+      setSelection(new Set([cardPastedOnly[0].db_id]));
+    }
+    const cardPasteCount = cardPastedOnly.length;
+    const topPasteCount = pasted.length - cardPasteCount;
+    if (cardPasteCount && !topPasteCount) {
+      setStatus(
+        `${cardPasteCount}개 모듈 카드를 빈 슬롯에 붙여넣었습니다.`,
+      );
+    } else if (cardPasteCount) {
+      setStatus(
+        `${topPasteCount}개 장비와 ${cardPasteCount}개 모듈 카드를 붙여넣었습니다.`,
+      );
+    } else {
+      setStatus(`${pasted.length}개 장비를 새 ID로 붙여넣었습니다.`);
+    }
   } catch (error) {
     setStatus(`붙여넣기 실패: ${error.message}`);
   }
@@ -2585,7 +3364,7 @@ function finishMarquee() {
   const bottom = Math.max(start.y, current.y);
   const crossing = current.x < start.x;
   const ids = new Set(additive);
-  for (const item of state.items) {
+  for (const item of canvasItems()) {
     const box = itemBox(item);
     const contained =
       box.x0 >= left && box.x1 <= right && box.y0 >= top && box.y1 <= bottom;
@@ -2678,6 +3457,8 @@ async function loadAllLinks() {
   } catch {
     state.links = [];
   }
+  const items = selectedItemsOrdered();
+  if (items.length === 2) updatePathTrace(items);
   draw();
 }
 
@@ -2717,15 +3498,54 @@ async function fetchConnectionNames(item) {
   }
 }
 
-function portMenuHtml(item, byType) {
+function portRowsHtml(owner, byType, groupLabel = "") {
+  const spec = specFor(owner);
+  const ifaces = interfaceTotals(spec);
+  const draft = state.linkDraft;
+  const rows = [];
+  if (groupLabel) {
+    rows.push(`<div class="port-menu-group">${escapeHtml(groupLabel)}</div>`);
+  }
+  for (const iface of ifaces) {
+    for (let index = 1; index <= iface.port_count; index += 1) {
+      const name = byType[iface.interface_type]?.[index - 1] || "";
+      const link = portLinkFor(owner, iface.interface_type, index);
+      const peer = portPeerSummary(link, owner.db_id);
+      const isDraft = Boolean(
+        draft
+        && draft.db_id === owner.db_id
+        && draft.interface_type === iface.interface_type
+        && draft.port_index === index,
+      );
+      rows.push(`
+        <div class="port-menu-row${peer ? " is-linked" : ""}${isDraft ? " is-draft" : ""}">
+          <button type="button" class="port-menu-select"
+                  data-equipment-db-id="${owner.db_id}"
+                  data-interface-type="${escapeHtml(iface.interface_type)}"
+                  data-port-index="${index}"
+                  data-connection-name="${escapeHtml(name)}">
+            <span class="port-menu-label">${escapeHtml(
+              formatPortLabel(iface.interface_type, index, name),
+            )}</span>
+            ${peer ? `<span class="port-menu-peer">→ ${escapeHtml(
+              peer.equipmentName || peer.equipmentId,
+            )} / ${escapeHtml(
+              formatPortLabel(peer.interfaceType, peer.portIndex, peer.connectionName),
+            )}</span>` : ""}
+          </button>
+          ${peer ? `<button type="button" class="port-menu-unlink" data-link-id="${peer.linkId}">해제</button>` : ""}
+        </div>
+      `);
+    }
+  }
+  return rows.join("");
+}
+
+function portMenuHtml(item, sections) {
   const spec = specFor(item);
   const title = escapeHtml(item.equipment_name || spec?.name || item.spec_key);
   let html =
     `<div class="port-menu-title">${title} · ${escapeHtml(item.equipment_id)}</div>`;
-  const ifaces = interfaceTotals(spec);
-  if (!ifaces.length) {
-    return `${html}<div class="port-menu-empty">등록된 포트가 없습니다.</div>`;
-  }
   const draft = state.linkDraft;
   if (draft && draft.db_id !== item.db_id) {
     html += `<div class="port-menu-hint">${escapeHtml(
@@ -2738,37 +3558,13 @@ function portMenuHtml(item, byType) {
   } else {
     html += '<div class="port-menu-hint">시작할 포트를 선택하세요</div>';
   }
-  const rows = [];
-  for (const iface of ifaces) {
-    for (let index = 1; index <= iface.port_count; index += 1) {
-      const name = byType[iface.interface_type]?.[index - 1] || "";
-      const link = portLinkFor(item, iface.interface_type, index);
-      const peer = portPeerSummary(link, item.db_id);
-      const isDraft = Boolean(
-        draft
-        && draft.db_id === item.db_id
-        && draft.interface_type === iface.interface_type
-        && draft.port_index === index,
-      );
-      rows.push(`
-        <div class="port-menu-row${peer ? " is-linked" : ""}${isDraft ? " is-draft" : ""}">
-          <button type="button" class="port-menu-select"
-                  data-interface-type="${escapeHtml(iface.interface_type)}"
-                  data-port-index="${index}"
-                  data-connection-name="${escapeHtml(name)}">
-            <span class="port-menu-label">${escapeHtml(
-              formatPortLabel(iface.interface_type, index, name),
-            )}</span>
-            ${peer ? `<span class="port-menu-peer">→ ${escapeHtml(peer.equipmentId)} / ${escapeHtml(
-              formatPortLabel(peer.interfaceType, peer.portIndex, peer.connectionName),
-            )}</span>` : ""}
-          </button>
-          ${peer ? `<button type="button" class="port-menu-unlink" data-link-id="${peer.linkId}">해제</button>` : ""}
-        </div>
-      `);
-    }
+  const body = sections.map(({ owner, byType, label }) => (
+    portRowsHtml(owner, byType, label)
+  )).join("");
+  if (!body) {
+    return `${html}<div class="port-menu-empty">등록된 포트가 없습니다.</div>`;
   }
-  return `${html}<div class="port-menu-list">${rows.join("")}</div>`;
+  return `${html}<div class="port-menu-list">${body}</div>`;
 }
 
 async function openPortMenu(item, x, y) {
@@ -2776,9 +3572,35 @@ async function openPortMenu(item, x, y) {
   hideContextMenu();
   item._portLinksLoaded = false;
   await ensurePortLinks(item);
-  const byType = await fetchConnectionNames(item);
+  const sections = [
+    {
+      owner: item,
+      byType: await fetchConnectionNames(item),
+      label: isModuleFrame(item) ? "프레임" : "",
+    },
+  ];
+  if (isModuleFrame(item)) {
+    const slotData = await api(`/api/equipment/${item.db_id}/slots`);
+    for (const slot of slotData.slots || []) {
+      if (!slot.card) continue;
+      let card = state.items.find((entry) => entry.db_id === slot.card.db_id);
+      if (!card) {
+        card = slot.card;
+        state.items.push(card);
+      } else {
+        Object.assign(card, slot.card);
+      }
+      card._portLinksLoaded = false;
+      await ensurePortLinks(card);
+      sections.push({
+        owner: card,
+        byType: await fetchConnectionNames(card),
+        label: `슬롯 ${slot.slot_index} · ${card.equipment_name || specFor(card)?.name || "카드"}`,
+      });
+    }
+  }
   state.portMenuItemId = item.db_id;
-  portMenu.innerHTML = portMenuHtml(item, byType);
+  portMenu.innerHTML = portMenuHtml(item, sections);
   portMenu.classList.remove("hidden");
   const menuWidth = portMenu.offsetWidth || 236;
   const menuHeight = portMenu.offsetHeight || 200;
@@ -2826,10 +3648,10 @@ async function handlePortSelect(item, interfaceType, portIndex, connectionName) 
 }
 
 portMenu.addEventListener("click", async (event) => {
-  const item = state.items.find(
+  const host = state.items.find(
     (entry) => entry.db_id === state.portMenuItemId,
   );
-  if (!item) return;
+  if (!host) return;
   const unlinkButton = event.target.closest(".port-menu-unlink");
   if (unlinkButton) {
     const linkId = Number(unlinkButton.dataset.linkId);
@@ -2840,9 +3662,11 @@ portMenu.addEventListener("click", async (event) => {
         entry._portLinks = [];
       }
       await loadAllLinks();
-      await ensurePortLinks(item);
-      const byType = await fetchConnectionNames(item);
-      portMenu.innerHTML = portMenuHtml(item, byType);
+      const point = {
+        x: Number.parseFloat(portMenu.style.left) || 8,
+        y: Number.parseFloat(portMenu.style.top) || 8,
+      };
+      await openPortMenu(host, point.x, point.y);
       setStatus("포트 연결을 해제했습니다.");
     } catch (error) {
       setStatus(`해제 실패: ${error.message}`);
@@ -2851,8 +3675,10 @@ portMenu.addEventListener("click", async (event) => {
   }
   const selectButton = event.target.closest(".port-menu-select");
   if (selectButton) {
+    const ownerId = Number(selectButton.dataset.equipmentDbId);
+    const owner = state.items.find((entry) => entry.db_id === ownerId) || host;
     await handlePortSelect(
-      item,
+      owner,
       selectButton.dataset.interfaceType,
       Number(selectButton.dataset.portIndex),
       selectButton.dataset.connectionName || "",
@@ -2906,7 +3732,9 @@ board.addEventListener("mousedown", (event) => {
     } else if (!state.selected.has(hit.db_id)) {
       setSelection(new Set([hit.db_id]));
     }
-    const movable = selectedItems().filter((item) => !item.locked);
+    const movable = selectedItems().filter(
+      (item) => !item.locked && isCanvasItem(item),
+    );
     if (movable.length) {
       state.drag = {
         last: point,
@@ -2925,6 +3753,8 @@ board.addEventListener("mousedown", (event) => {
   };
   if (!event.ctrlKey) {
     state.selected = new Set();
+    state.selectionOrder = [];
+    clearPathTrace();
     renderInspector();
   }
   draw();
@@ -3077,8 +3907,8 @@ document.addEventListener("keydown", (event) => {
     return;
   }
   if (event.ctrlKey && event.key.toLowerCase() === "c") {
-    // 우측 장비 정보 등에서 드래그 선택한 텍스트는 브라우저 기본 복사 사용
-    if (hasTextSelection() || isInspectorTarget(event.target)) return;
+    // 텍스트를 드래그 선택한 경우만 브라우저 기본 복사
+    if (hasTextSelection()) return;
     if (state.selected.size) {
       event.preventDefault();
       copySelected();
@@ -3086,7 +3916,7 @@ document.addEventListener("keydown", (event) => {
     return;
   }
   if (event.ctrlKey && event.key.toLowerCase() === "v") {
-    if (isInspectorTarget(event.target)) return;
+    if (isTextFieldTarget(event.target)) return;
     event.preventDefault();
     pasteEquipment();
     return;
@@ -3122,7 +3952,9 @@ document.addEventListener("keydown", (event) => {
   };
   if (!directions[event.key]) return;
   if (isInspectorTarget(event.target)) return;
-  const items = selectedItems().filter((item) => !item.locked);
+  const items = selectedItems().filter(
+    (item) => !item.locked && isCanvasItem(item),
+  );
   if (!items.length) return;
   event.preventDefault();
   const before = items.map(geometrySnapshot);
