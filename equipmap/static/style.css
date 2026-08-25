@@ -59,8 +59,9 @@ button:disabled {
 
 .toolbar-group button:first-child { border-radius: 5px 0 0 5px; }
 .toolbar-group button:last-child { border-radius: 0 5px 5px 0; }
+.toolbar-group button:only-child { border-radius: 5px; }
 .toolbar-group .zoom-value { min-width: 62px; font-size: 12px; }
-.status { color: #667085; font-size: 12px; }
+.status { color: #667085; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 42vw; }
 
 .workspace {
   display: grid;
@@ -695,6 +696,83 @@ button:disabled {
   line-height: 1.5;
 }
 
+.path-trace-route {
+  margin: 0 0 8px;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  background: #fff;
+  overflow: hidden;
+}
+
+.path-trace-route.is-selected {
+  border-color: #fdba74;
+  box-shadow: 0 0 0 1px rgba(234, 88, 12, 0.15);
+}
+
+.path-trace-route-button {
+  display: grid;
+  gap: 6px;
+  width: 100%;
+  margin: 0;
+  padding: 8px 10px;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.path-trace-route-button:hover {
+  background: #fff7ed;
+}
+
+.path-trace-route.is-selected .path-trace-route-button {
+  background: #fff7ed;
+}
+
+.path-trace-route-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  color: #374151;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.path-trace-route-meta {
+  margin-left: auto;
+  color: #6b7280;
+  font-weight: 600;
+}
+
+.path-trace-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  flex: 0 0 auto;
+}
+
+.path-trace-chain {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font-size: 11px;
+  line-height: 1.55;
+  color: #9a3412;
+}
+
+.path-trace-route .path-trace-list {
+  margin: 0;
+  padding: 0 10px 10px;
+  border-top: 1px solid #fed7aa;
+}
+
+.path-chain-node {
+  font-weight: 600;
+  color: #c2410c;
+}
+
 .path-endpoint {
   display: inline-block;
   margin-right: 4px;
@@ -740,6 +818,20 @@ button:disabled {
   grid-template-columns: 22px minmax(0, 1fr);
   gap: 6px;
   align-items: start;
+}
+
+.path-trace-hop.is-passthrough .path-trace-step {
+  background: #ede9fe;
+  color: #5b21b6;
+}
+
+.path-trace-hop.is-passthrough .path-trace-body {
+  border-color: #ddd6fe;
+  background: #f5f3ff;
+}
+
+.path-trace-hop.is-passthrough .path-trace-arrow {
+  color: #6d28d9;
 }
 
 .path-trace-step {
@@ -827,6 +919,10 @@ button:disabled {
 }
 
 .interface-type-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
   min-width: 0;
   padding: 0;
   border: 0;
@@ -926,6 +1022,16 @@ button:disabled {
   font-size: 11px;
 }
 
+.connection-patch-hint {
+  margin: 0 0 8px;
+  padding: 6px 8px;
+  border: 1px solid #ddd6fe;
+  border-radius: 4px;
+  background: #f5f3ff;
+  color: #5b21b6;
+  font-size: 11px;
+}
+
 .link-draft-note button,
 .link-draft-cancel {
   margin-left: 6px;
@@ -944,15 +1050,35 @@ button:disabled {
   padding: 0;
 }
 
+.interface-dir-badge {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  padding: 1px 5px;
+  border-radius: 3px;
+  line-height: 1.4;
+}
+
+.interface-dir-input {
+  color: #1d4ed8;
+  background: #dbeafe;
+}
+
+.interface-dir-output {
+  color: #c2410c;
+  background: #ffedd5;
+}
+
 .interface-edit-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 58px 24px;
+  grid-template-columns: minmax(0, 1fr) 108px 52px 24px;
   gap: 5px;
   align-items: center;
   margin-bottom: 6px;
 }
 
-.interface-edit-row input {
+.interface-edit-row input,
+.interface-edit-row select {
   min-width: 0;
   padding: 5px 6px;
   border: 1px solid #cfd4dc;

@@ -74,6 +74,10 @@ const state = {
   pathBlinkTimer: null,
 };
 
+let drawFrame = 0;
+let geometrySaveTimer = 0;
+const pendingGeometrySaves = new Map();
+
 function escapeHtml(value) {
   return String(value ?? "")
     .replaceAll("&", "&amp;")
@@ -85,6 +89,7 @@ function escapeHtml(value) {
 
 async function api(url, options = {}) {
   const response = await fetch(url, {
+    cache: "no-store",
     headers: { "Content-Type": "application/json", ...(options.headers || {}) },
     ...options,
   });
@@ -270,7 +275,18 @@ function drawGrid() {
   if (spacing < 8) return;
   const startX = ((state.offsetX % spacing) + spacing) % spacing;
   const startY = ((state.offsetY % spacing) + spacing) % spacing;
+  const interacting = Boolean(state.drag || state.pan || state.marquee);
   ctx.fillStyle = "#d8dce3";
+  if (interacting) {
+    // 드래그/팬 중에는 점 대신 가벼운 사각형으로 그려 프레임 비용을 줄인다.
+    const size = Math.max(1, Math.min(2, state.zoom));
+    for (let x = startX; x < width; x += spacing) {
+      for (let y = startY; y < height; y += spacing) {
+        ctx.fillRect(x, y, size, size);
+      }
+    }
+    return;
+  }
   for (let x = startX; x < width; x += spacing) {
     for (let y = startY; y < height; y += spacing) {
       ctx.beginPath();
@@ -683,6 +699,7 @@ function drawEquipment() {
     else if (item.spec_key === "drawer_2ru") drawDrawer(item, box);
     else if (item.spec_key === "pdu_2ru") drawPdu(item, box);
     else if (item.spec_key.startsWith("blank_panel_")) drawBlankPanel(item, box);
+    else if (item.spec_key.startsWith("patch_")) drawBroadcastDevice(item, box);
     else drawBroadcastDevice(item, box);
   }
 }
@@ -698,67 +715,335 @@ function drawFlowArrowHead(x, y, ux, uy, size) {
   ctx.fill();
 }
 
-function drawDirectedPathCable(fromPt, toPt, phase) {
+/** 신호 흐름: 출력=하단 중앙, 입력=상단 중앙 */
+function equipmentExitPoint(box) {
+  return { x: (box.x0 + box.x1) / 2, y: box.y1 };
+}
+
+function equipmentEntryPoint(box) {
+  return { x: (box.x0 + box.x1) / 2, y: box.y0 };
+}
+
+function hostRackForItem(item) {
+  if (!item) return null;
+  if (isRackKey(item.spec_key)) return item;
+  return nearestRack(item.world_x, item.world_y);
+}
+
+function sortedRacks() {
+  return state.items
+    .filter((item) => isRackKey(item.spec_key))
+    .sort((left, right) => left.world_x - right.world_x);
+}
+
+/** 랙 오른쪽 통로(옆 랙과의 간격 중앙). 출력 하향에 사용 */
+function rackRightChannelX(rack, laneOffset = 0) {
+  const box = itemBox(rack);
+  const gap = Math.max(14, Math.min(box.width * 0.14, 36 * state.zoom));
+  const racks = sortedRacks();
+  const index = racks.findIndex((entry) => entry.db_id === rack.db_id);
+  const next = index >= 0 ? racks[index + 1] : null;
+  if (next) {
+    const nextBox = itemBox(next);
+    return (box.x1 + nextBox.x0) / 2 + laneOffset;
+  }
+  return box.x1 + gap + laneOffset;
+}
+
+/** 랙 왼쪽 통로. 입력 상향에 사용 */
+function rackLeftChannelX(rack, laneOffset = 0) {
+  const box = itemBox(rack);
+  const gap = Math.max(14, Math.min(box.width * 0.14, 36 * state.zoom));
+  const racks = sortedRacks();
+  const index = racks.findIndex((entry) => entry.db_id === rack.db_id);
+  const prev = index > 0 ? racks[index - 1] : null;
+  if (prev) {
+    const prevBox = itemBox(prev);
+    return (prevBox.x1 + box.x0) / 2 + laneOffset;
+  }
+  return box.x0 - gap + laneOffset;
+}
+
+function bottomTrunkY(sourceRack, destRack, fallbackY, laneOffset = 0) {
+  const bottoms = [];
+  if (sourceRack) bottoms.push(itemBox(sourceRack).y1);
+  if (destRack) bottoms.push(itemBox(destRack).y1);
+  const base = bottoms.length
+    ? Math.max(...bottoms)
+    : fallbackY;
+  return base + Math.max(28, 40 * state.zoom) + laneOffset;
+}
+
+function simplifyOrthogonalPoints(points) {
+  if (!points?.length) return [];
+  const cleaned = [points[0]];
+  for (let index = 1; index < points.length; index += 1) {
+    const prev = cleaned[cleaned.length - 1];
+    const point = points[index];
+    if (Math.hypot(point.x - prev.x, point.y - prev.y) < 0.5) continue;
+    cleaned.push(point);
+  }
+  const result = [];
+  for (let index = 0; index < cleaned.length; index += 1) {
+    const prev = result[result.length - 1];
+    const point = cleaned[index];
+    const next = cleaned[index + 1];
+    if (
+      prev
+      && next
+      && (
+        (Math.abs(prev.x - point.x) < 0.5 && Math.abs(point.x - next.x) < 0.5)
+        || (Math.abs(prev.y - point.y) < 0.5 && Math.abs(point.y - next.y) < 0.5)
+      )
+    ) {
+      continue;
+    }
+    result.push(point);
+  }
+  return result;
+}
+
+/**
+ * 랙 배선 규칙:
+ * 출력(하단 중앙) → 아래로 → 랙 오른쪽 통로 하향 → 하단 트레이 →
+ * 대상 랙 왼쪽 통로 상향 → 오른쪽으로 → 입력(상단 중앙)
+ */
+function signalFlowCablePoints(fromBox, toBox, sourceRack, destRack, laneOffset = 0) {
+  const fromPt = equipmentExitPoint(fromBox);
+  const toPt = equipmentEntryPoint(toBox);
+  const stub = Math.max(8, 12 * state.zoom);
+  const dropY = fromPt.y + stub;
+  const riseY = toPt.y - stub;
+
+  if (!sourceRack && !destRack) {
+    const trunkY = Math.max(fromPt.y, toPt.y) + stub * 3 + Math.abs(laneOffset);
+    return simplifyOrthogonalPoints([
+      fromPt,
+      { x: fromPt.x, y: dropY },
+      { x: fromPt.x, y: trunkY },
+      { x: toPt.x, y: trunkY },
+      { x: toPt.x, y: riseY },
+      toPt,
+    ]);
+  }
+
+  const src = sourceRack || destRack;
+  const dst = destRack || sourceRack;
+  // 같은 간격에 하향/상향이 겹치면 살짝 어긋나게
+  const downLane = laneOffset + Math.max(4, 5 * state.zoom);
+  const upLane = -laneOffset - Math.max(4, 5 * state.zoom);
+  const rightX = rackRightChannelX(src, downLane);
+  const leftX = rackLeftChannelX(dst, upLane);
+  const trunkY = bottomTrunkY(
+    sourceRack,
+    destRack,
+    Math.max(fromPt.y, toPt.y),
+    Math.abs(laneOffset) * 0.35,
+  );
+  // 상단 접근점은 트레이보다 위, 장비 상단보다 약간 위
+  const approachY = Math.min(toPt.y - stub, trunkY - stub);
+
+  return simplifyOrthogonalPoints([
+    fromPt,
+    { x: fromPt.x, y: dropY },
+    { x: rightX, y: dropY },
+    { x: rightX, y: trunkY },
+    { x: leftX, y: trunkY },
+    { x: leftX, y: approachY },
+    { x: toPt.x, y: approachY },
+    toPt,
+  ]);
+}
+
+/** 레거시 폴백용 직교 경로 (현재 신호흐름은 signalFlowCablePoints 사용) */
+function orthogonalCablePoints(fromPt, toPt, laneOffset = 0) {
   const dx = toPt.x - fromPt.x;
   const dy = toPt.y - fromPt.y;
-  const len = Math.hypot(dx, dy) || 1;
-  const ux = dx / len;
-  const uy = dy / len;
+  if (Math.abs(dx) < 1 && Math.abs(dy) < 1) {
+    return [fromPt, toPt];
+  }
+  if (Math.abs(dy) < 2) {
+    return [fromPt, toPt];
+  }
+  if (Math.abs(dx) < 2) {
+    return [fromPt, toPt];
+  }
+  const stub = Math.max(10, 14 * state.zoom);
+  const leaveX = fromPt.x + Math.sign(dx) * stub;
+  const enterX = toPt.x - Math.sign(dx) * stub;
+  let midX = (leaveX + enterX) / 2 + laneOffset;
+  if (Math.sign(dx) > 0 && midX < leaveX) midX = leaveX + Math.abs(laneOffset);
+  if (Math.sign(dx) < 0 && midX > leaveX) midX = leaveX - Math.abs(laneOffset);
+  return [
+    fromPt,
+    { x: leaveX, y: fromPt.y },
+    { x: midX, y: fromPt.y },
+    { x: midX, y: toPt.y },
+    { x: enterX, y: toPt.y },
+    toPt,
+  ];
+}
+
+function polylineLength(points) {
+  let total = 0;
+  for (let i = 1; i < points.length; i += 1) {
+    total += Math.hypot(
+      points[i].x - points[i - 1].x,
+      points[i].y - points[i - 1].y,
+    );
+  }
+  return total;
+}
+
+function pointAlongPolyline(points, distance) {
+  let remaining = Math.max(0, distance);
+  for (let i = 1; i < points.length; i += 1) {
+    const a = points[i - 1];
+    const b = points[i];
+    const seg = Math.hypot(b.x - a.x, b.y - a.y) || 0;
+    if (seg <= 0.0001) continue;
+    if (remaining <= seg) {
+      const t = remaining / seg;
+      const ux = (b.x - a.x) / seg;
+      const uy = (b.y - a.y) / seg;
+      return {
+        x: a.x + (b.x - a.x) * t,
+        y: a.y + (b.y - a.y) * t,
+        ux,
+        uy,
+      };
+    }
+    remaining -= seg;
+  }
+  const last = points[points.length - 1];
+  const prev = points[Math.max(0, points.length - 2)];
+  const seg = Math.hypot(last.x - prev.x, last.y - prev.y) || 1;
+  return {
+    x: last.x,
+    y: last.y,
+    ux: (last.x - prev.x) / seg,
+    uy: (last.y - prev.y) / seg,
+  };
+}
+
+function strokePolyline(points) {
+  if (!points.length) return;
+  ctx.beginPath();
+  ctx.moveTo(points[0].x, points[0].y);
+  for (let i = 1; i < points.length; i += 1) {
+    ctx.lineTo(points[i].x, points[i].y);
+  }
+  ctx.stroke();
+}
+
+function drawCableTerminal(point, kind) {
+  const radius = Math.max(3.2, 3.8 * state.zoom);
+  ctx.beginPath();
+  if (kind === "exit") {
+    ctx.arc(point.x, point.y, radius, 0, Math.PI * 2);
+  } else {
+    // 입력: 상단 진입을 강조하는 반원
+    ctx.arc(point.x, point.y, radius, Math.PI, 0, false);
+    ctx.closePath();
+  }
+  ctx.fill();
+}
+
+function pathFlowColors(pathIndex = 0) {
+  const palettes = [
+    { stroke: "#dc2626", soft: "#f87171", fill: "#b91c1c" },
+    { stroke: "#ea580c", soft: "#fb923c", fill: "#c2410c" },
+    { stroke: "#ca8a04", soft: "#facc15", fill: "#a16207" },
+    { stroke: "#2563eb", soft: "#60a5fa", fill: "#1d4ed8" },
+    { stroke: "#7c3aed", soft: "#a78bfa", fill: "#5b21b6" },
+    { stroke: "#0d9488", soft: "#5eead4", fill: "#0f766e" },
+  ];
+  return palettes[Math.abs(pathIndex) % palettes.length];
+}
+
+function drawDirectedPathCable(
+  fromBox,
+  toBox,
+  sourceItem,
+  destItem,
+  phase,
+  laneOffset = 0,
+  pathIndex = 0,
+) {
+  const sourceRack = hostRackForItem(sourceItem);
+  const destRack = hostRackForItem(destItem);
+  const points = signalFlowCablePoints(
+    fromBox,
+    toBox,
+    sourceRack,
+    destRack,
+    laneOffset,
+  );
+  const fromPt = points[0];
+  const toPt = points[points.length - 1];
+  const len = polylineLength(points) || 1;
   const blink = state.pathBlinkOn;
+  const colors = pathFlowColors(pathIndex);
 
   ctx.save();
   ctx.lineCap = "round";
-  ctx.strokeStyle = blink ? "#dc2626" : "#f87171";
+  ctx.lineJoin = "round";
+  ctx.strokeStyle = blink ? colors.stroke : colors.soft;
   ctx.lineWidth = Math.max(2.6, state.zoom * 2.6);
-  ctx.shadowColor = blink ? "rgba(220, 38, 38, 0.5)" : "transparent";
+  ctx.shadowColor = blink ? `${colors.stroke}80` : "transparent";
   ctx.shadowBlur = blink ? 8 : 0;
   ctx.setLineDash([12, 10]);
   ctx.lineDashOffset = -phase;
-  ctx.beginPath();
-  ctx.moveTo(fromPt.x, fromPt.y);
-  ctx.lineTo(toPt.x, toPt.y);
-  ctx.stroke();
+  strokePolyline(points);
   ctx.setLineDash([]);
   ctx.shadowBlur = 0;
 
-  ctx.fillStyle = blink ? "#b91c1c" : "#ef4444";
-  const spacing = Math.max(28, 34 * state.zoom);
+  ctx.fillStyle = blink ? colors.fill : colors.soft;
+  drawCableTerminal(fromPt, "exit");
+  drawCableTerminal(toPt, "entry");
+
+  const spacing = Math.max(48, 56 * state.zoom);
   const arrowSize = Math.max(5, 6.5 * state.zoom);
-  const offset = phase % spacing;
-  for (let distance = offset; distance < len - arrowSize; distance += spacing) {
-    drawFlowArrowHead(
-      fromPt.x + ux * distance,
-      fromPt.y + uy * distance,
-      ux,
-      uy,
-      arrowSize,
-    );
+  // 화살표는 성기게: 끝점 하나 + 경로 중간 소수만
+  const tip = pointAlongPolyline(points, Math.max(0, len - arrowSize * 0.2));
+  drawFlowArrowHead(tip.x, tip.y, tip.ux, tip.uy, arrowSize * 1.15);
+  if (len > spacing * 1.5) {
+    const mid = pointAlongPolyline(points, len * 0.45);
+    drawFlowArrowHead(mid.x, mid.y, mid.ux, mid.uy, arrowSize);
   }
-  // 끝점 화살표
-  drawFlowArrowHead(
-    toPt.x - ux * arrowSize * 0.2,
-    toPt.y - uy * arrowSize * 0.2,
-    ux,
-    uy,
-    arrowSize * 1.15,
-  );
   ctx.restore();
 }
 
 function drawSelection() {
   ctx.save();
-  const pathActive = Boolean(state.pathTrace);
-  const pathEquip = new Set(state.pathTrace?.equipmentIds || []);
+  const trace = state.pathTrace;
+  const pathActive = Boolean(trace && !trace.missing && !trace.sameGroup);
+  const selectedIndex = trace?.selectedPathIndex;
+  let pathEquip = new Set();
+  if (pathActive && selectedIndex != null) {
+    const summary = (trace.paths || []).find(
+      (entry) => (Number(entry.pathIndex) || 0) === Number(selectedIndex),
+    );
+    pathEquip = new Set(summary?.equipmentIds || []);
+    if (!pathEquip.size) {
+      for (const hop of trace.hops || []) {
+        if ((Number(hop.pathIndex) || 0) !== Number(selectedIndex)) continue;
+        pathEquip.add(hop.from.dbId);
+        pathEquip.add(hop.to.dbId);
+      }
+    }
+  }
   const ordered = selectedItemsOrdered();
+  const activeColors = pathFlowColors(Number(selectedIndex) || 0);
 
   for (const item of ordered) {
     const visual = cableAnchorItem(item);
     if (!visual || !isCanvasItem(visual)) continue;
     const box = itemBox(visual);
     const isCard = Boolean(item.parent_equipment_id);
-    if (pathActive) {
+    if (pathActive && selectedIndex != null) {
       ctx.setLineDash([5, 3]);
-      ctx.strokeStyle = state.pathBlinkOn ? "#dc2626" : "#fca5a5";
+      ctx.strokeStyle = state.pathBlinkOn ? activeColors.stroke : activeColors.soft;
       ctx.lineWidth = 2.6;
     } else {
       ctx.setLineDash([5, 3]);
@@ -772,7 +1057,7 @@ function drawSelection() {
       const label = orderIndex === 0 ? "1" : "2";
       const badge = Math.max(12, 14 * state.zoom);
       ctx.setLineDash([]);
-      ctx.fillStyle = state.pathBlinkOn ? "#dc2626" : "#f87171";
+      ctx.fillStyle = state.pathBlinkOn ? activeColors.stroke : activeColors.soft;
       ctx.beginPath();
       ctx.arc(box.x0 - 2, box.y0 - 2, badge / 2, 0, Math.PI * 2);
       ctx.fill();
@@ -786,7 +1071,7 @@ function drawSelection() {
 
   if (pathEquip.size) {
     ctx.setLineDash([4, 3]);
-    ctx.strokeStyle = state.pathBlinkOn ? "#dc2626" : "#fca5a5";
+    ctx.strokeStyle = state.pathBlinkOn ? activeColors.stroke : activeColors.soft;
     ctx.lineWidth = 2;
     for (const dbId of pathEquip) {
       if (state.selected.has(dbId)) continue;
@@ -829,15 +1114,139 @@ function edgeAnchor(box, targetX, targetY) {
   return { x: cx + dx * scale, y: cy + dy * scale };
 }
 
+/** @returns {"input"|"output"|""} */
+function interfaceDirection(interfaceType) {
+  const text = String(interfaceType || "").trim().toUpperCase();
+  if (!text) return "";
+  if (/(?:^|[\s_-])INPUT(?:$|[\s_-])/.test(` ${text} `) || /(?:^|[\s_-])IN$/.test(text)) {
+    return "input";
+  }
+  if (/(?:^|[\s_-])OUTPUT(?:$|[\s_-])/.test(` ${text} `) || /(?:^|[\s_-])OUT$/.test(text)) {
+    return "output";
+  }
+  return "";
+}
+
+function splitInterfaceType(interfaceType) {
+  const text = String(interfaceType || "").trim();
+  const match = text.match(/^(.*?)(?:[\s_-]+(INPUT|OUTPUT|IN|OUT))$/i);
+  if (!match || !match[1].trim()) {
+    return { base: text, direction: interfaceDirection(text) };
+  }
+  const token = match[2].toUpperCase();
+  const direction = (token === "IN" || token === "INPUT")
+    ? "input"
+    : (token === "OUT" || token === "OUTPUT")
+      ? "output"
+      : "";
+  return { base: match[1].trim(), direction };
+}
+
+function composeInterfaceType(base, direction) {
+  const name = String(base || "").trim();
+  if (!name) return "";
+  if (direction === "input") return `${name} INPUT`;
+  if (direction === "output") return `${name} OUTPUT`;
+  return name;
+}
+
+function formatInterfaceLabel(interfaceType) {
+  const { base, direction } = splitInterfaceType(interfaceType);
+  if (direction === "input") return `${base || interfaceType} INPUT`;
+  if (direction === "output") return `${base || interfaceType} OUTPUT`;
+  return interfaceType || "기타";
+}
+
+function portAnchorPoint(
+  box,
+  interfaceType,
+  portIndex = 1,
+  portCount = 1,
+  peerX = null,
+  peerY = null,
+) {
+  const dir = interfaceDirection(interfaceType);
+  const cx = (box.x0 + box.x1) / 2;
+  // INPUT=상단 중앙, OUTPUT=하단 중앙
+  if (dir === "input") return { x: cx, y: box.y0 };
+  if (dir === "output") return { x: cx, y: box.y1 };
+  if (peerX == null || peerY == null) {
+    return { x: cx, y: (box.y0 + box.y1) / 2 };
+  }
+  // 방향 미지정: 상대 위치가 위면 상단(입력), 아래면 하단(출력)
+  if (peerY < (box.y0 + box.y1) / 2) return { x: cx, y: box.y0 };
+  if (peerY > (box.y0 + box.y1) / 2) return { x: cx, y: box.y1 };
+  return edgeAnchor(box, peerX, peerY);
+}
+
+function interfacePortCountFor(item, interfaceType) {
+  const entry = interfaceTotals(specFor(item), item)
+    .find((iface) => iface.interface_type === interfaceType);
+  return entry?.port_count || 1;
+}
+
 function drawCables() {
-  // 평소에는 숨기고, 장비 2개 선택으로 신호 흐름이 잡힐 때만 경로 케이블 표시
-  const hops = state.pathTrace?.hops;
-  if (!hops?.length || !state.links.length) return;
-  const pathLinkIds = new Set(hops.map((hop) => hop.linkId));
+  // 선택된 흐름만 캔버스에 표시 (미선택 시 그리지 않음)
+  const trace = state.pathTrace;
+  if (!trace?.hops?.length) return;
+  if (trace.selectedPathIndex == null) return;
+  const selectedIndex = Number(trace.selectedPathIndex);
+  const hops = trace.hops.filter(
+    (hop) => (Number(hop.pathIndex) || 0) === selectedIndex,
+  );
+  if (!hops.length) return;
   const byId = new Map(state.items.map((item) => [item.db_id, item]));
+  const linkById = new Map(state.links.map((link) => [link.link_id, link]));
+  const laneGap = Math.max(10, 14 * state.zoom);
+
+  ctx.save();
+  ctx.lineCap = "round";
+
+  const seenPass = new Set();
+  for (const hop of hops) {
+    if (hop.kind !== "passthrough" && hop.kind !== "transit") continue;
+    const passKey = [
+      hop.from.dbId,
+      hop.kind,
+      hop.from.interfaceType,
+      hop.from.portIndex,
+      hop.to.interfaceType,
+      hop.to.portIndex,
+    ].join(":");
+    if (seenPass.has(passKey)) continue;
+    seenPass.add(passKey);
+    const raw = byId.get(hop.from.dbId);
+    const item = cableAnchorItem(raw);
+    if (!item) continue;
+    const box = itemBox(item);
+    const fromPt = equipmentEntryPoint(box);
+    const toPt = equipmentExitPoint(box);
+    drawPassthroughPath(
+      fromPt,
+      toPt,
+      hop.kind === "passthrough" ? hop.from.portIndex : null,
+      state.pathFlowPhase,
+      hop.kind,
+    );
+  }
+
+  const cableHops = [];
+  const seenLinks = new Set();
+  for (const hop of hops) {
+    if (hop.kind !== "cable" || hop.linkId == null) continue;
+    if (seenLinks.has(hop.linkId)) continue;
+    seenLinks.add(hop.linkId);
+    cableHops.push(hop);
+  }
+  if (!cableHops.length) {
+    ctx.restore();
+    return;
+  }
+
   const pairOffset = new Map();
-  for (const link of state.links) {
-    if (!pathLinkIds.has(link.link_id)) continue;
+  for (const hop of cableHops) {
+    const link = linkById.get(hop.linkId);
+    if (!link) continue;
     const aItem = cableAnchorItem(byId.get(link.a_equipment_db_id));
     const bItem = cableAnchorItem(byId.get(link.b_equipment_db_id));
     if (!aItem || !bItem) continue;
@@ -845,12 +1254,9 @@ function drawCables() {
     pairOffset.set(key, (pairOffset.get(key) || 0) + 1);
   }
   const pairSeen = new Map();
-  const gap = Math.max(5, 8 * state.zoom);
-  ctx.save();
-  ctx.lineCap = "round";
-  for (const link of state.links) {
-    const hop = hops.find((entry) => entry.linkId === link.link_id);
-    if (!hop) continue;
+  for (const hop of cableHops) {
+    const link = linkById.get(hop.linkId);
+    if (!link) continue;
     const aRaw = byId.get(link.a_equipment_db_id);
     const bRaw = byId.get(link.b_equipment_db_id);
     const a = cableAnchorItem(aRaw);
@@ -858,28 +1264,64 @@ function drawCables() {
     if (!a || !b) continue;
     const boxA = itemBox(a);
     const boxB = itemBox(b);
-    const ca = { x: (boxA.x0 + boxA.x1) / 2, y: (boxA.y0 + boxA.y1) / 2 };
-    const cb = { x: (boxB.x0 + boxB.x1) / 2, y: (boxB.y0 + boxB.y1) / 2 };
     const key = [a.db_id, b.db_id].sort((n, m) => n - m).join("-");
     const total = pairOffset.get(key) || 1;
     const seen = pairSeen.get(key) || 0;
     pairSeen.set(key, seen + 1);
-    let ox = 0;
-    let oy = 0;
-    if (total > 1) {
-      const len = Math.hypot(cb.x - ca.x, cb.y - ca.y) || 1;
-      const shift = (seen - (total - 1) / 2) * gap;
-      ox = (-(cb.y - ca.y) / len) * shift;
-      oy = ((cb.x - ca.x) / len) * shift;
-    }
-    const pa = edgeAnchor(boxA, cb.x + ox, cb.y + oy);
-    const pb = edgeAnchor(boxB, ca.x + ox, ca.y + oy);
-    pa.x += ox; pa.y += oy;
-    pb.x += ox; pb.y += oy;
-    const fromIsA = hop.from.dbId === link.a_equipment_db_id;
-    const fromPt = fromIsA ? pa : pb;
-    const toPt = fromIsA ? pb : pa;
-    drawDirectedPathCable(fromPt, toPt, state.pathFlowPhase);
+    const laneOffset = total > 1
+      ? (seen - (total - 1) / 2) * laneGap
+      : 0;
+    const fromIsA = hop.from.dbId === link.a_equipment_db_id
+      && hop.from.interfaceType === link.a_interface_type
+      && hop.from.portIndex === link.a_port_index;
+    const fromItem = fromIsA ? a : b;
+    const toItem = fromIsA ? b : a;
+    const fromBox = fromIsA ? boxA : boxB;
+    const toBox = fromIsA ? boxB : boxA;
+    drawDirectedPathCable(
+      fromBox,
+      toBox,
+      fromItem,
+      toItem,
+      state.pathFlowPhase,
+      laneOffset,
+      selectedIndex,
+    );
+  }
+  ctx.restore();
+}
+
+function drawPassthroughPath(fromPt, toPt, portIndex, phase, kind = "passthrough") {
+  // 장비 내부 통과: 상단 → 하단
+  const points = [fromPt, toPt];
+  const len = polylineLength(points) || 1;
+  const blink = state.pathBlinkOn;
+  const isPatch = kind === "passthrough";
+  ctx.save();
+  ctx.lineCap = "round";
+  ctx.setLineDash([6, 4]);
+  ctx.strokeStyle = blink
+    ? (isPatch ? "#7c3aed" : "#0d9488")
+    : (isPatch ? "#a78bfa" : "#5eead4");
+  ctx.lineWidth = Math.max(2.2, state.zoom * 2.2);
+  strokePolyline(points);
+  ctx.setLineDash([]);
+  const travel = ((phase % 100) / 100) * len;
+  const tip = pointAlongPolyline(points, travel);
+  ctx.fillStyle = blink
+    ? (isPatch ? "#5b21b6" : "#0f766e")
+    : (isPatch ? "#7c3aed" : "#14b8a6");
+  drawFlowArrowHead(tip.x, tip.y, tip.ux, tip.uy, Math.max(4, state.zoom * 4));
+  if (portIndex != null) {
+    ctx.font = `${Math.max(8, state.zoom * 9)}px "Segoe UI", sans-serif`;
+    ctx.textAlign = "left";
+    ctx.textBaseline = "middle";
+    ctx.fillStyle = isPatch ? "#5b21b6" : "#0f766e";
+    ctx.fillText(
+      `#${portIndex}`,
+      Math.max(fromPt.x, toPt.x) + 4,
+      (fromPt.y + toPt.y) / 2,
+    );
   }
   ctx.restore();
 }
@@ -891,6 +1333,14 @@ function draw() {
   drawSelection();
   drawMarquee();
   zoomEl.textContent = `${Math.round(state.zoom * 100)}%`;
+}
+
+function scheduleDraw() {
+  if (drawFrame) return;
+  drawFrame = requestAnimationFrame(() => {
+    drawFrame = 0;
+    draw();
+  });
 }
 
 function categoryOrderValue(key) {
@@ -1244,9 +1694,10 @@ function startPlacement(spec) {
   state.placeSpec = spec;
   clearSelection();
   board.classList.add("placing");
-  placeBanner.textContent = `${spec.name} 배치: 캔버스를 클릭하세요. (Esc 취소)`;
+  placeBanner.textContent =
+    `${spec.name} 배치: 캔버스를 클릭해 반복 배치하세요. (Esc 취소)`;
   placeBanner.classList.remove("hidden");
-  setStatus(`배치 준비: ${spec.name}`);
+  setStatus(`배치 준비: ${spec.name} (반복 배치 가능, Esc 취소)`);
   renderCatalog();
 }
 
@@ -1258,6 +1709,7 @@ function cancelPlacement() {
     updateLinkDraftBanner();
   } else {
     placeBanner.classList.add("hidden");
+    placeBanner.textContent = "";
   }
   renderCatalog();
   setStatus("준비됨");
@@ -1303,9 +1755,11 @@ async function placeEquipment(spec, x, y) {
       }),
     });
     state.items.push(item);
-    cancelPlacement();
-    setSelection(new Set([item.db_id]));
-    setStatus(`${spec.name} 배치 완료`);
+    clearSelection();
+    draw();
+    setStatus(
+      `${spec.name} 배치 완료 — 같은 장비를 계속 배치할 수 있습니다 (Esc 취소)`,
+    );
   } catch (error) {
     setStatus(error.message);
     alert(error.message);
@@ -1325,7 +1779,7 @@ function nearestRack(worldX, worldY) {
   }, null).rack;
 }
 
-function snapRackPlacement(x, y, width, height, excludeId = null) {
+function snapRackPlacement(x, y, width, height, excludeId = null, alignToRow = true) {
   const racks = state.items.filter(
     (item) =>
       isRackKey(item.spec_key) &&
@@ -1373,16 +1827,19 @@ function snapRackPlacement(x, y, width, height, excludeId = null) {
 
   const anchor = candidate.rack;
   const anchorBottom = anchor.world_y + anchor.layout_height / 2;
-  const row = racks.filter(
-    (rack) =>
-      Math.abs(
-        rack.world_y + rack.layout_height / 2 - anchorBottom,
-      ) < 0.01,
-  );
   if (candidate.placeRight) {
-    const rightEdge = Math.max(
-      ...row.map((rack) => rack.world_x + rack.layout_width / 2),
-    );
+    let rightEdge = anchor.world_x + anchor.layout_width / 2;
+    if (alignToRow) {
+      const row = racks.filter(
+        (rack) =>
+          Math.abs(
+            rack.world_y + rack.layout_height / 2 - anchorBottom,
+          ) < 0.01,
+      );
+      rightEdge = Math.max(
+        ...row.map((rack) => rack.world_x + rack.layout_width / 2),
+      );
+    }
     return {
       x: rightEdge + width / 2,
       y: anchorBottom - height / 2,
@@ -1391,9 +1848,18 @@ function snapRackPlacement(x, y, width, height, excludeId = null) {
       rack: anchor,
     };
   }
-  const leftEdge = Math.min(
-    ...row.map((rack) => rack.world_x - rack.layout_width / 2),
-  );
+  let leftEdge = anchor.world_x - anchor.layout_width / 2;
+  if (alignToRow) {
+    const row = racks.filter(
+      (rack) =>
+        Math.abs(
+          rack.world_y + rack.layout_height / 2 - anchorBottom,
+        ) < 0.01,
+    );
+    leftEdge = Math.min(
+      ...row.map((rack) => rack.world_x - rack.layout_width / 2),
+    );
+  }
   return {
     x: leftEdge - width / 2,
     y: anchorBottom - height / 2,
@@ -1404,12 +1870,14 @@ function snapRackPlacement(x, y, width, height, excludeId = null) {
 }
 
 function snapRackItem(item) {
+  // 기존 랙은 이웃에만 붙인다. 행 전체 끝으로 보내면 배치가 붕괴된다.
   const snapped = snapRackPlacement(
     item.world_x,
     item.world_y,
     item.layout_width,
     item.layout_height,
     item.db_id,
+    false,
   );
   if (!snapped.rack) return false;
   const changed =
@@ -1524,22 +1992,11 @@ function normalizeRackSizes() {
 }
 
 function normalizeNearbyRackRows() {
-  const racks = state.items
-    .filter((item) => isRackKey(item.spec_key))
-    .sort((a, b) => a.db_id - b.db_id);
-  for (let index = 1; index < racks.length; index += 1) {
-    const rack = racks[index];
-    if (snapRackItem(rack)) saveItem(rack);
-  }
+  // 저장된 랙 좌표를 유지한다. 로드 시 강제 스냅은 배치를 붕괴시킨다.
 }
 
 function normalizeRackMountedItems() {
-  for (const item of state.items) {
-    if (!isRackMountedSpec(specFor(item))) continue;
-    if (snapItemToRack(item)) {
-      saveItem(item);
-    }
-  }
+  // 저장된 장비 좌표/크기를 유지한다. 로드 시 재스냅하지 않는다.
 }
 
 function setSelection(ids) {
@@ -1584,13 +2041,33 @@ function setSelection(ids) {
     if (path?.sameGroup) {
       setStatus("선택: 같은 프레임/장비 그룹");
     } else if (path?.hops?.length) {
-      setStatus(
-        `신호 흐름: ${path.fromName} → ${path.toName} (${path.hops.length}구간)`,
-      );
+      const flowCount = Math.max(1, Number(path.pathCount) || 1);
+      if (flowCount > 1 && path.selectedPathIndex == null) {
+        setStatus(
+          `신호 흐름 ${flowCount}개 — 우측에서 흐름을 선택하세요`,
+        );
+      } else {
+        const selected = path.selectedPathIndex == null
+          ? 1
+          : Number(path.selectedPathIndex) + 1;
+        setStatus(
+          `신호 흐름 ${selected}/${flowCount}: ${path.fromName} → ${path.toName}`,
+        );
+      }
     } else {
       setStatus(
         `선택: ${equipmentDisplayName(items[0])} → ${equipmentDisplayName(items[1])} — 연결 경로 없음`,
       );
+    }
+  } else if (items.length > 2) {
+    const path = state.pathTrace;
+    if (path?.hops?.length) {
+      setStatus(
+        `연속 신호 흐름: ${(path.chainNames || []).join(" → ")}`
+        + ` (${path.hops.length}구간)`,
+      );
+    } else {
+      setStatus(`선택: ${items.length}대 — 순서대로 이어진 경로가 없습니다`);
     }
   } else {
     setStatus(`선택: ${items.length}개 장비`);
@@ -1616,103 +2093,377 @@ function equipmentDisplayName(item) {
   return item.equipment_name || specFor(item)?.name || item.equipment_id;
 }
 
-function buildLinkAdjacency() {
-  const adj = new Map();
+function portNodeKey(dbId, interfaceType, portIndex) {
+  return `${dbId}\0${interfaceType}\0${portIndex}`;
+}
+
+function parsePortNodeKey(key) {
+  const [dbId, interfaceType, portIndex] = String(key).split("\0");
+  return {
+    dbId: Number(dbId),
+    interfaceType,
+    portIndex: Number(portIndex),
+  };
+}
+
+function portKeysForEquipmentGroup(item) {
+  const keys = [];
+  for (const id of equipmentGroupIds(item)) {
+    const equipment = state.items.find((entry) => entry.db_id === id);
+    if (!equipment) continue;
+    const ifaces = interfaceTotals(specFor(equipment), equipment);
+    for (const iface of ifaces) {
+      for (let index = 1; index <= iface.port_count; index += 1) {
+        keys.push(portNodeKey(id, iface.interface_type, index));
+      }
+    }
+  }
+  // 링크에만 존재하는 포트도 시작/도착 후보에 포함
   for (const link of state.links) {
-    const a = link.a_equipment_db_id;
-    const b = link.b_equipment_db_id;
-    if (!adj.has(a)) adj.set(a, []);
-    if (!adj.has(b)) adj.set(b, []);
-    adj.get(a).push({ to: b, link, fromIsA: true });
-    adj.get(b).push({ to: a, link, fromIsA: false });
+    for (const side of [
+      [link.a_equipment_db_id, link.a_interface_type, link.a_port_index],
+      [link.b_equipment_db_id, link.b_interface_type, link.b_port_index],
+    ]) {
+      if (!equipmentGroupIds(item).has(side[0])) continue;
+      const key = portNodeKey(side[0], side[1], side[2]);
+      if (!keys.includes(key)) keys.push(key);
+    }
+  }
+  return keys;
+}
+
+function buildPortAdjacency() {
+  const adj = new Map();
+  const addEdge = (fromKey, edge) => {
+    if (!adj.has(fromKey)) adj.set(fromKey, []);
+    adj.get(fromKey).push(edge);
+  };
+
+  for (const link of state.links) {
+    const aKey = portNodeKey(
+      link.a_equipment_db_id,
+      link.a_interface_type,
+      link.a_port_index,
+    );
+    const bKey = portNodeKey(
+      link.b_equipment_db_id,
+      link.b_interface_type,
+      link.b_port_index,
+    );
+    addEdge(aKey, { toKey: bKey, kind: "cable", link, fromIsA: true });
+    addEdge(bKey, { toKey: aKey, kind: "cable", link, fromIsA: false });
+  }
+
+  for (const item of state.items) {
+    if (isPatchPanel(item)) {
+      const ifaces = interfaceTotals(specFor(item), item);
+      const inputs = ifaces.filter(
+        (iface) => interfaceDirection(iface.interface_type) === "input",
+      );
+      const outputs = ifaces.filter(
+        (iface) => interfaceDirection(iface.interface_type) === "output",
+      );
+      for (const input of inputs) {
+        const base = splitInterfaceType(input.interface_type).base.toLowerCase();
+        const output = outputs.find(
+          (iface) => splitInterfaceType(iface.interface_type).base.toLowerCase() === base,
+        );
+        if (!output) continue;
+        const count = Math.min(input.port_count, output.port_count);
+        for (let index = 1; index <= count; index += 1) {
+          const inKey = portNodeKey(item.db_id, input.interface_type, index);
+          const outKey = portNodeKey(item.db_id, output.interface_type, index);
+          addEdge(inKey, {
+            toKey: outKey,
+            kind: "passthrough",
+            equipmentDbId: item.db_id,
+            portIndex: index,
+            fromInterfaceType: input.interface_type,
+            toInterfaceType: output.interface_type,
+          });
+          addEdge(outKey, {
+            toKey: inKey,
+            kind: "passthrough",
+            equipmentDbId: item.db_id,
+            portIndex: index,
+            fromInterfaceType: output.interface_type,
+            toInterfaceType: input.interface_type,
+          });
+        }
+      }
+      continue;
+    }
+
+    // 일반 장비: 케이블이 붙은 INPUT → OUTPUT 만 내부 통과로 본다.
+    // (INPUT↔INPUT 같은 가상 연결은 만들지 않음)
+    const linkedKeys = [];
+    for (const link of state.links) {
+      if (link.a_equipment_db_id === item.db_id) {
+        linkedKeys.push(portNodeKey(
+          item.db_id,
+          link.a_interface_type,
+          link.a_port_index,
+        ));
+      }
+      if (link.b_equipment_db_id === item.db_id) {
+        linkedKeys.push(portNodeKey(
+          item.db_id,
+          link.b_interface_type,
+          link.b_port_index,
+        ));
+      }
+    }
+    const unique = [...new Set(linkedKeys)];
+    if (unique.length < 2) continue;
+    for (let i = 0; i < unique.length; i += 1) {
+      for (let j = 0; j < unique.length; j += 1) {
+        if (i === j) continue;
+        const fromPort = parsePortNodeKey(unique[i]);
+        const toPort = parsePortNodeKey(unique[j]);
+        if (!canTransitInternally(
+          fromPort.interfaceType,
+          toPort.interfaceType,
+        )) {
+          continue;
+        }
+        addEdge(unique[i], {
+          toKey: unique[j],
+          kind: "transit",
+          equipmentDbId: item.db_id,
+          fromInterfaceType: fromPort.interfaceType,
+          toInterfaceType: toPort.interfaceType,
+          fromPortIndex: fromPort.portIndex,
+          toPortIndex: toPort.portIndex,
+        });
+      }
+    }
   }
   return adj;
 }
 
-function findConnectionPath(startItem, endItem) {
-  const starts = equipmentGroupIds(startItem);
-  const goals = equipmentGroupIds(endItem);
-  if ([...starts].some((id) => goals.has(id))) {
-    return { hops: [], linkIds: [], equipmentIds: [...starts], sameGroup: true };
-  }
-  const adj = buildLinkAdjacency();
-  const queue = [];
-  const visited = new Set();
-  const parent = new Map();
-  for (const id of starts) {
-    queue.push(id);
-    visited.add(id);
-    parent.set(id, null);
-  }
-  let found = null;
-  while (queue.length) {
-    const current = queue.shift();
-    if (goals.has(current)) {
-      found = current;
-      break;
-    }
-    for (const edge of adj.get(current) || []) {
-      if (visited.has(edge.to)) continue;
-      visited.add(edge.to);
-      parent.set(edge.to, { from: current, edge });
-      queue.push(edge.to);
-    }
-  }
-  if (found == null) return null;
+/** 장비 내부 통과는 신호가 들어오는 쪽 → 나가는 쪽만 허용 */
+function canTransitInternally(fromInterfaceType, toInterfaceType) {
+  const fromDir = interfaceDirection(fromInterfaceType);
+  const toDir = interfaceDirection(toInterfaceType);
+  if (fromDir === "input" && toDir === "output") return true;
+  if (fromDir === "input" && !toDir) return true;
+  if (!fromDir && toDir === "output") return true;
+  return false;
+}
 
-  const edges = [];
-  let cursor = found;
-  while (parent.get(cursor)) {
-    const step = parent.get(cursor);
-    edges.push(step.edge);
-    cursor = step.from;
+function hopEndpointFromPort(dbId, interfaceType, portIndex, link = null) {
+  const item = state.items.find((entry) => entry.db_id === dbId);
+  let connectionName = "";
+  if (link) {
+    if (
+      link.a_equipment_db_id === dbId
+      && link.a_interface_type === interfaceType
+      && link.a_port_index === portIndex
+    ) {
+      connectionName = link.a_connection_name || "";
+    } else if (
+      link.b_equipment_db_id === dbId
+      && link.b_interface_type === interfaceType
+      && link.b_port_index === portIndex
+    ) {
+      connectionName = link.b_connection_name || "";
+    }
   }
-  edges.reverse();
+  return {
+    dbId,
+    equipmentId: item?.equipment_id || "",
+    equipmentName: item?.equipment_name || "",
+    name: equipmentDisplayName(item),
+    interfaceType,
+    portIndex,
+    connectionName,
+  };
+}
 
+function hopsFromSearchTrail(trail) {
   const hops = [];
   const linkIds = [];
   const equipmentIds = new Set();
-  for (const edge of edges) {
-    const link = edge.link;
-    const fromIsA = edge.fromIsA;
-    const fromDbId = fromIsA ? link.a_equipment_db_id : link.b_equipment_db_id;
-    const toDbId = fromIsA ? link.b_equipment_db_id : link.a_equipment_db_id;
-    const fromItem = state.items.find((entry) => entry.db_id === fromDbId);
-    const toItem = state.items.find((entry) => entry.db_id === toDbId);
+  for (const step of trail) {
+    const fromPort = parsePortNodeKey(step.fromKey);
+    const toPort = parsePortNodeKey(step.edge.toKey);
+    equipmentIds.add(fromPort.dbId);
+    equipmentIds.add(toPort.dbId);
+    if (step.edge.kind === "passthrough" || step.edge.kind === "transit") {
+      hops.push({
+        kind: step.edge.kind,
+        linkId: null,
+        from: hopEndpointFromPort(
+          fromPort.dbId,
+          fromPort.interfaceType,
+          fromPort.portIndex,
+        ),
+        to: hopEndpointFromPort(
+          toPort.dbId,
+          toPort.interfaceType,
+          toPort.portIndex,
+        ),
+      });
+      continue;
+    }
+    const link = step.edge.link;
     hops.push({
+      kind: "cable",
       linkId: link.link_id,
-      from: {
-        dbId: fromDbId,
-        equipmentId: fromIsA ? link.a_equipment_id : link.b_equipment_id,
-        equipmentName: fromIsA ? link.a_equipment_name : link.b_equipment_name,
-        name: equipmentDisplayName(fromItem)
-          || (fromIsA ? link.a_equipment_name : link.b_equipment_name),
-        interfaceType: fromIsA ? link.a_interface_type : link.b_interface_type,
-        portIndex: fromIsA ? link.a_port_index : link.b_port_index,
-        connectionName: fromIsA ? link.a_connection_name : link.b_connection_name,
-      },
-      to: {
-        dbId: toDbId,
-        equipmentId: fromIsA ? link.b_equipment_id : link.a_equipment_id,
-        equipmentName: fromIsA ? link.b_equipment_name : link.a_equipment_name,
-        name: equipmentDisplayName(toItem)
-          || (fromIsA ? link.b_equipment_name : link.a_equipment_name),
-        interfaceType: fromIsA ? link.b_interface_type : link.a_interface_type,
-        portIndex: fromIsA ? link.b_port_index : link.a_port_index,
-        connectionName: fromIsA ? link.b_connection_name : link.a_connection_name,
-      },
+      from: hopEndpointFromPort(
+        fromPort.dbId,
+        fromPort.interfaceType,
+        fromPort.portIndex,
+        link,
+      ),
+      to: hopEndpointFromPort(
+        toPort.dbId,
+        toPort.interfaceType,
+        toPort.portIndex,
+        link,
+      ),
     });
     linkIds.push(link.link_id);
-    equipmentIds.add(fromDbId);
-    equipmentIds.add(toDbId);
   }
+  return { hops, linkIds, equipmentIds };
+}
+
+function pathSignature(path) {
+  if (path.linkIds?.length) {
+    return `L:${[...path.linkIds].sort((a, b) => a - b).join(",")}`;
+  }
+  return `H:${(path.hops || []).map((hop) => (
+    `${hop.kind}:${hop.from.dbId}:${hop.from.interfaceType}:${hop.from.portIndex}`
+    + `>${hop.to.dbId}:${hop.to.interfaceType}:${hop.to.portIndex}`
+  )).join("|")}`;
+}
+
+function findPathBetweenPorts(startKey, goalKey, adj) {
+  if (startKey === goalKey) return null;
+  const queue = [startKey];
+  const visited = new Set([startKey]);
+  const parent = new Map([[startKey, null]]);
+  while (queue.length) {
+    const current = queue.shift();
+    if (current === goalKey) break;
+    for (const edge of adj.get(current) || []) {
+      if (visited.has(edge.toKey)) continue;
+      visited.add(edge.toKey);
+      parent.set(edge.toKey, { fromKey: current, edge });
+      queue.push(edge.toKey);
+    }
+  }
+  if (!parent.has(goalKey)) return null;
+  const trail = [];
+  let cursor = goalKey;
+  while (parent.get(cursor)) {
+    const step = parent.get(cursor);
+    trail.push(step);
+    cursor = step.fromKey;
+  }
+  if (!trail.length) return null;
+  trail.reverse();
+  return hopsFromSearchTrail(trail);
+}
+
+function findConnectionPath(startItem, endItem) {
+  const paths = findAllConnectionPaths(startItem, endItem, { maxPaths: 1 });
+  if (paths === null) {
+    return {
+      hops: [],
+      linkIds: [],
+      equipmentIds: [...equipmentGroupIds(startItem)],
+      sameGroup: true,
+    };
+  }
+  if (!paths.length) return null;
+  const path = paths[0];
+  return {
+    ...path,
+    sameGroup: false,
+    fromName: equipmentDisplayName(startItem),
+    toName: equipmentDisplayName(endItem),
+  };
+}
+
+/** 시작·끝 장비 사이 서로 다른 케이블 구성을 모두 찾는다. */
+function findAllConnectionPaths(startItem, endItem, { maxPaths = 20 } = {}) {
+  const startKeys = portKeysForEquipmentGroup(startItem);
+  const goalKeys = portKeysForEquipmentGroup(endItem);
+  const startEquipIds = equipmentGroupIds(startItem);
+  if ([...startEquipIds].some((id) => equipmentGroupIds(endItem).has(id))) {
+    return null;
+  }
+  if (!startKeys.length || !goalKeys.length) return [];
+
+  const adj = buildPortAdjacency();
+  const results = [];
+  const seen = new Set();
+  for (const startKey of startKeys) {
+    for (const goalKey of goalKeys) {
+      if (results.length >= maxPaths) break;
+      const built = findPathBetweenPorts(startKey, goalKey, adj);
+      if (!built?.hops?.length) continue;
+      const signature = pathSignature(built);
+      if (seen.has(signature)) continue;
+      seen.add(signature);
+      results.push({
+        hops: built.hops,
+        linkIds: built.linkIds,
+        equipmentIds: [...built.equipmentIds],
+      });
+    }
+    if (results.length >= maxPaths) break;
+  }
+  results.sort((left, right) => (
+    left.hops.length - right.hops.length
+    || left.linkIds.length - right.linkIds.length
+  ));
+  return results;
+}
+
+function chainNamesFromHops(hops) {
+  const chain = [];
+  for (const hop of hops) {
+    if (!chain.length) chain.push(hop.from.name);
+    if (chain[chain.length - 1] !== hop.to.name) chain.push(hop.to.name);
+  }
+  return chain;
+}
+
+function mergeConnectionPaths(paths, startItem, endItem) {
+  const hops = [];
+  const linkIds = [];
+  const equipmentIds = new Set();
+  const pathSummaries = [];
+  paths.forEach((path, pathIndex) => {
+    for (const hop of path.hops) {
+      hops.push({ ...hop, pathIndex });
+      if (hop.linkId != null) linkIds.push(hop.linkId);
+      equipmentIds.add(hop.from.dbId);
+      equipmentIds.add(hop.to.dbId);
+    }
+    pathSummaries.push({
+      pathIndex,
+      hopCount: path.hops.length,
+      linkIds: [...path.linkIds],
+      chainNames: chainNamesFromHops(path.hops),
+      equipmentIds: [...path.equipmentIds],
+    });
+  });
   return {
     hops,
     linkIds,
     equipmentIds: [...equipmentIds],
+    paths: pathSummaries,
+    pathCount: paths.length,
     sameGroup: false,
     fromName: equipmentDisplayName(startItem),
     toName: equipmentDisplayName(endItem),
+    chainNames: pathSummaries[0]?.chainNames || [
+      equipmentDisplayName(startItem),
+      equipmentDisplayName(endItem),
+    ],
   };
 }
 
@@ -1727,11 +2478,12 @@ function stopPathBlink() {
 
 function startPathBlink() {
   stopPathBlink();
-  const linkCount = state.pathTrace?.linkIds?.size || 0;
-  if (!linkCount) return;
+  if (state.pathTrace?.selectedPathIndex == null) return;
+  const hopCount = state.pathTrace?.hops?.length || 0;
+  if (!hopCount) return;
   let tick = 0;
   state.pathBlinkTimer = setInterval(() => {
-    if (!state.pathTrace) {
+    if (!state.pathTrace || state.pathTrace.selectedPathIndex == null) {
       stopPathBlink();
       return;
     }
@@ -1747,11 +2499,77 @@ function clearPathTrace() {
   state.pathTrace = null;
 }
 
+function findChainedConnectionPath(items) {
+  const hops = [];
+  const linkIds = [];
+  const equipmentIds = new Set();
+  for (let index = 0; index < items.length - 1; index += 1) {
+    const segment = findConnectionPath(items[index], items[index + 1]);
+    if (!segment) return null;
+    if (segment.sameGroup) {
+      for (const id of segment.equipmentIds || []) equipmentIds.add(id);
+      continue;
+    }
+    if (!segment.hops?.length) return null;
+    for (const hop of segment.hops) {
+      hops.push(hop);
+      if (hop.linkId != null) linkIds.push(hop.linkId);
+      equipmentIds.add(hop.from.dbId);
+      equipmentIds.add(hop.to.dbId);
+    }
+  }
+  if (!hops.length) return null;
+  return {
+    hops,
+    linkIds,
+    equipmentIds: [...equipmentIds],
+    sameGroup: false,
+    fromName: equipmentDisplayName(items[0]),
+    toName: equipmentDisplayName(items[items.length - 1]),
+    chainNames: items.map((item) => equipmentDisplayName(item)),
+  };
+}
+
 function updatePathTrace(items) {
   clearPathTrace();
-  if (items.length !== 2) return;
+  if (items.length < 2) return;
   if (!state.links.length) return;
-  const path = findConnectionPath(items[0], items[1]);
+
+  let path = null;
+  if (items.length === 2) {
+    const paths = findAllConnectionPaths(items[0], items[1]);
+    if (paths === null) {
+      state.pathTrace = {
+        hops: [],
+        linkIds: new Set(),
+        equipmentIds: [...equipmentGroupIds(items[0])],
+        sameGroup: true,
+        fromName: equipmentDisplayName(items[0]),
+        toName: equipmentDisplayName(items[1]),
+        pathCount: 0,
+        paths: [],
+      };
+      return;
+    }
+    if (!paths.length) {
+      state.pathTrace = {
+        hops: [],
+        linkIds: new Set(),
+        equipmentIds: [],
+        missing: true,
+        fromName: equipmentDisplayName(items[0]),
+        toName: equipmentDisplayName(items[1]),
+        chainNames: items.map((item) => equipmentDisplayName(item)),
+        pathCount: 0,
+        paths: [],
+      };
+      return;
+    }
+    path = mergeConnectionPaths(paths, items[0], items[1]);
+  } else {
+    path = findChainedConnectionPath(items);
+  }
+
   if (!path) {
     state.pathTrace = {
       hops: [],
@@ -1759,7 +2577,10 @@ function updatePathTrace(items) {
       equipmentIds: [],
       missing: true,
       fromName: equipmentDisplayName(items[0]),
-      toName: equipmentDisplayName(items[1]),
+      toName: equipmentDisplayName(items[items.length - 1]),
+      chainNames: items.map((item) => equipmentDisplayName(item)),
+      pathCount: 0,
+      paths: [],
     };
     return;
   }
@@ -1770,18 +2591,72 @@ function updatePathTrace(items) {
       equipmentIds: path.equipmentIds,
       sameGroup: true,
       fromName: path.fromName || equipmentDisplayName(items[0]),
-      toName: path.toName || equipmentDisplayName(items[1]),
+      toName: path.toName || equipmentDisplayName(items[items.length - 1]),
+      pathCount: 0,
+      paths: [],
     };
     return;
   }
+  const chain = path.chainNames || chainNamesFromHops(path.hops);
+  const pathCount = path.pathCount || 1;
+  const paths = path.paths || [{
+    pathIndex: 0,
+    hopCount: path.hops.length,
+    linkIds: [...path.linkIds],
+    chainNames: chain,
+    equipmentIds: path.equipmentIds,
+  }];
+  // 흐름이 하나면 바로 선택, 여러 개면 목록만 보여 사용자가 고르게 함
+  const selectedPathIndex = pathCount === 1 ? 0 : null;
   state.pathTrace = {
     hops: path.hops,
     linkIds: new Set(path.linkIds),
     equipmentIds: path.equipmentIds,
     fromName: path.fromName,
     toName: path.toName,
+    chainNames: chain,
+    pathCount,
+    paths,
+    selectedPathIndex,
   };
-  startPathBlink();
+  if (selectedPathIndex != null) startPathBlink();
+}
+
+function selectPathTrace(pathIndex) {
+  if (!state.pathTrace) return;
+  const next = Number(pathIndex);
+  if (!Number.isFinite(next)) return;
+  if (state.pathTrace.selectedPathIndex === next) {
+    // 다시 클릭하면 접기(캔버스 표시 해제)
+    if ((state.pathTrace.pathCount || 1) > 1) {
+      state.pathTrace.selectedPathIndex = null;
+      stopPathBlink();
+    }
+  } else {
+    state.pathTrace.selectedPathIndex = next;
+    startPathBlink();
+  }
+  renderInspector();
+  draw();
+  const selected = state.pathTrace.selectedPathIndex;
+  if (selected == null) {
+    setStatus(
+      `신호 흐름 ${state.pathTrace.pathCount}개 — 우측에서 흐름을 선택하세요`,
+    );
+  } else {
+    setStatus(
+      `신호 흐름 ${selected + 1}/${state.pathTrace.pathCount}: `
+      + `${state.pathTrace.fromName} → ${state.pathTrace.toName}`,
+    );
+  }
+}
+
+function bindPathTraceControls() {
+  document.querySelectorAll("[data-path-index]").forEach((button) => {
+    button.addEventListener("click", () => {
+      selectPathTrace(button.dataset.pathIndex);
+    });
+  });
 }
 
 function renderPathTraceHtml(path) {
@@ -1801,12 +2676,86 @@ function renderPathTraceHtml(path) {
         <p class="path-trace-empty">
           <span class="path-endpoint start">1 시작</span>${escapeHtml(path.fromName)}
           <span class="path-flow-sep">→</span>
-          <span class="path-endpoint end">2 도착</span>${escapeHtml(path.toName)}
+          <span class="path-endpoint end">도착</span>${escapeHtml(path.toName)}
           사이에 케이블로 이어진 경로가 없습니다.
         </p>
       </section>
     `;
   }
+  const pathCount = Math.max(1, Number(path.pathCount) || 1);
+  const selectedIndex = path.selectedPathIndex;
+  const summaries = Array.isArray(path.paths) && path.paths.length
+    ? path.paths
+    : [{
+      pathIndex: 0,
+      hopCount: path.hops.length,
+      chainNames: path.chainNames,
+      equipmentIds: path.equipmentIds,
+    }];
+  const pathBlocks = summaries.map((summary) => {
+    const index = Number(summary.pathIndex) || 0;
+    const selected = selectedIndex != null && Number(selectedIndex) === index;
+    const color = pathFlowColors(index).stroke;
+    const hops = path.hops.filter(
+      (hop) => (Number(hop.pathIndex) || 0) === index,
+    );
+    const chain = Array.isArray(summary.chainNames) && summary.chainNames.length
+      ? summary.chainNames
+      : chainNamesFromHops(hops);
+    const chainHtml = chain.map((name, nameIndex) => (
+      `${nameIndex ? '<span class="path-flow-sep">→</span>' : ""}`
+      + `<span class="path-chain-node">${escapeHtml(name)}</span>`
+    )).join("");
+    const detailHtml = selected
+      ? `
+        <ol class="path-trace-list">
+          ${hops.map((hop, hopIndex) => `
+            <li class="path-trace-hop${hop.kind === "passthrough" || hop.kind === "transit" ? " is-passthrough" : ""}">
+              <span class="path-trace-step">${hopIndex + 1}</span>
+              <div class="path-trace-body">
+                <div>
+                  <strong>${escapeHtml(hop.from.name)}</strong>
+                  <span class="path-trace-port">${escapeHtml(formatPortLabel(
+                    hop.from.interfaceType,
+                    hop.from.portIndex,
+                    hop.from.connectionName,
+                  ))}</span>
+                </div>
+                <div class="path-trace-arrow">
+                  ${hop.kind === "passthrough"
+                    ? `↕ PATCH #${hop.from.portIndex} passthrough`
+                    : hop.kind === "transit"
+                      ? "↕ 장비 내부 통과"
+                      : "↓ 신호 흐름"}
+                </div>
+                <div>
+                  <strong>${escapeHtml(hop.to.name)}</strong>
+                  <span class="path-trace-port">${escapeHtml(formatPortLabel(
+                    hop.to.interfaceType,
+                    hop.to.portIndex,
+                    hop.to.connectionName,
+                  ))}</span>
+                </div>
+              </div>
+            </li>
+          `).join("")}
+        </ol>
+      `
+      : "";
+    return `
+      <div class="path-trace-route${selected ? " is-selected" : ""}">
+        <button type="button" class="path-trace-route-button" data-path-index="${index}">
+          <span class="path-trace-route-title">
+            <span class="path-trace-swatch" style="background:${color}"></span>
+            흐름 ${index + 1}
+            <span class="path-trace-route-meta">${hops.length || summary.hopCount || 0}구간</span>
+          </span>
+          <span class="path-trace-chain">${chainHtml}</span>
+        </button>
+        ${detailHtml}
+      </div>
+    `;
+  }).join("");
   return `
     <section class="info-section path-trace-section">
       <h2>신호 흐름</h2>
@@ -1814,60 +2763,59 @@ function renderPathTraceHtml(path) {
         <span class="path-endpoint start">1 시작</span>
         ${escapeHtml(path.fromName)}
         <span class="path-flow-sep">→</span>
-        <span class="path-endpoint end">2 도착</span>
+        <span class="path-endpoint end">도착</span>
         ${escapeHtml(path.toName)}
-        · ${path.hops.length}구간
+        · 흐름 ${pathCount}개
       </p>
-      <ol class="path-trace-list">
-        ${path.hops.map((hop, index) => `
-          <li class="path-trace-hop">
-            <span class="path-trace-step">${index + 1}</span>
-            <div class="path-trace-body">
-              <div>
-                <strong>${escapeHtml(hop.from.name)}</strong>
-                <span class="path-trace-port">${escapeHtml(formatPortLabel(
-                  hop.from.interfaceType,
-                  hop.from.portIndex,
-                  hop.from.connectionName,
-                ))}</span>
-              </div>
-              <div class="path-trace-arrow">↓ 신호 흐름</div>
-              <div>
-                <strong>${escapeHtml(hop.to.name)}</strong>
-                <span class="path-trace-port">${escapeHtml(formatPortLabel(
-                  hop.to.interfaceType,
-                  hop.to.portIndex,
-                  hop.to.connectionName,
-                ))}</span>
-              </div>
-            </div>
-          </li>
-        `).join("")}
-      </ol>
-      <p class="path-trace-hint">캔버스: 1→2 방향으로 케이블 화살표가 흐르고, 선택 장비가 점멸합니다.</p>
+      ${pathBlocks}
+      <p class="path-trace-hint">${
+        pathCount > 1
+          ? "흐름을 선택하면 캔버스에 표시되고, 아래에 상세 구간이 펼쳐집니다."
+          : "경유 장비와 포트 구간이 아래에 표시됩니다."
+      }</p>
     </section>
   `;
 }
 
-function interfaceTotals(spec) {
-  const interfaces = Array.isArray(spec?.interfaces) ? [...spec.interfaces] : [];
+function resolvedEquipmentInterfaces(item) {
+  const own = Array.isArray(item?.interfaces) ? item.interfaces : [];
+  if (own.length) return [...own];
+  const spec = specFor(item);
+  return Array.isArray(spec?.interfaces) ? [...spec.interfaces] : [];
+}
+
+function interfaceTotals(spec, item = null) {
+  const source = item ? resolvedEquipmentInterfaces(item) : (
+    Array.isArray(spec?.interfaces) ? [...spec.interfaces] : []
+  );
+  const interfaces = [...source];
   const totals = new Map();
   const order = [];
   const sorted = interfaces.sort(
     (a, b) => (a.sort_order - b.sort_order) || (a.interface_id - b.interface_id),
   );
-  for (const item of sorted) {
-    const type = item.interface_type || "기타";
+  for (const itemEntry of sorted) {
+    const type = itemEntry.interface_type || "기타";
     if (!totals.has(type)) {
       totals.set(type, 0);
       order.push(type);
     }
-    totals.set(type, totals.get(type) + (Number(item.port_count) || 0));
+    totals.set(type, totals.get(type) + (Number(itemEntry.port_count) || 0));
   }
-  return order.map((type) => ({
-    interface_type: type,
-    port_count: totals.get(type),
-  }));
+  const directionRank = (type) => {
+    const dir = interfaceDirection(type);
+    if (dir === "input") return 0;
+    if (dir === "output") return 2;
+    return 1;
+  };
+  return order
+    .slice()
+    .sort((left, right) => directionRank(left) - directionRank(right))
+    .map((type) => ({
+      interface_type: type,
+      port_count: totals.get(type),
+      direction: interfaceDirection(type),
+    }));
 }
 
 function portLinkFor(item, interfaceType, portIndex) {
@@ -1918,7 +2866,7 @@ function updateLinkDraftBanner() {
   if (!state.linkDraft) {
     if (state.placeSpec) {
       placeBanner.textContent = (
-        `${state.placeSpec.name} 배치: 캔버스를 클릭하세요. (Esc 취소)`
+        `${state.placeSpec.name} 배치: 캔버스를 클릭해 반복 배치하세요. (Esc 취소)`
       );
       placeBanner.classList.remove("hidden");
     } else {
@@ -1954,7 +2902,7 @@ function clearLinkDraft() {
 }
 
 function renderInterfaceGroupsHtml(item, spec) {
-  const interfaces = interfaceTotals(spec);
+  const interfaces = interfaceTotals(spec, item);
   if (!interfaces.length) {
     return '<p class="connection-empty">등록된 인터페이스가 없습니다.</p>';
   }
@@ -1969,7 +2917,12 @@ function renderInterfaceGroupsHtml(item, spec) {
             <button type="button" class="interface-type-toggle"
                     data-interface-type="${escapeHtml(iface.interface_type)}"
                     aria-expanded="${expanded ? "true" : "false"}">
-              ${escapeHtml(iface.interface_type)}
+              ${escapeHtml(formatInterfaceLabel(iface.interface_type))}
+              ${iface.direction ? `
+                <span class="interface-dir-badge interface-dir-${iface.direction}">
+                  ${iface.direction === "input" ? "IN ←" : "OUT →"}
+                </span>
+              ` : ""}
             </button>
             <span class="interface-count">${iface.port_count}</span>
             ${expanded ? `
@@ -2032,11 +2985,19 @@ function renderInterfaceGroupsHtml(item, spec) {
 }
 
 function interfaceEditorRowHtml(item = { interface_type: "", port_count: 1 }) {
+  const split = splitInterfaceType(item.interface_type || "");
+  const direction = item.direction || split.direction || "";
+  const baseType = split.base || "";
   return `
     <div class="interface-edit-row">
-      <input class="interface-type-input" type="text" maxlength="40"
+      <input class="interface-type-input" type="text" maxlength="32"
              placeholder="종류 (예: BNC)" required
-             value="${escapeHtml(item.interface_type)}" aria-label="인터페이스 종류">
+             value="${escapeHtml(baseType)}" aria-label="인터페이스 종류">
+      <select class="interface-direction-input" aria-label="입출력 방향">
+        <option value="" ${!direction ? "selected" : ""}>방향 없음</option>
+        <option value="input" ${direction === "input" ? "selected" : ""}>INPUT (상단)</option>
+        <option value="output" ${direction === "output" ? "selected" : ""}>OUTPUT (하단)</option>
+      </select>
       <input class="interface-count-input" type="number" min="1" max="9999"
              value="${Number(item.port_count) || 1}" required aria-label="연결 수량">
       <button type="button" class="interface-remove" title="항목 제거"
@@ -2049,11 +3010,25 @@ function canEditConnections(spec) {
   return (
     spec?.category_key === "broadcast_equipment"
     || spec?.category_key === "module_card"
+    || spec?.id_prefix === "PATCH"
+    || String(spec?.key || "").startsWith("patch_")
+  );
+}
+
+function isPatchPanel(item) {
+  if (!item) return false;
+  const spec = specFor(item);
+  return (
+    spec?.id_prefix === "PATCH"
+    || String(item.spec_key || "").startsWith("patch_")
   );
 }
 
 function renderConnectionHtml(item, spec) {
   const editable = canEditConnections(spec);
+  const patchHint = isPatchPanel(item)
+    ? `<p class="connection-patch-hint">PATCH: 같은 번호의 INPUT→OUTPUT은 passthrough로 신호 흐름에 표시됩니다.</p>`
+    : "";
   if (!state.connectionEditing || !editable) {
     return `
       ${state.linkDraft ? `
@@ -2062,13 +3037,14 @@ function renderConnectionHtml(item, spec) {
           <button type="button" id="cancel-link-draft-panel">취소</button>
         </p>
       ` : ""}
+      ${patchHint}
       ${renderInterfaceGroupsHtml(item, spec)}
       ${editable
         ? '<div class="action-row"><button id="edit-interfaces">수정</button></div>'
         : ""}
     `;
   }
-  const interfaces = interfaceTotals(spec);
+  const interfaces = interfaceTotals(spec, item);
   return `
     <form id="interface-edit-form">
       <div id="interface-edit-list">
@@ -2117,7 +3093,7 @@ async function loadEquipmentConnections(item) {
       byType[row.interface_type][row.port_index - 1] = row.connection_name || "";
     }
     const next = {};
-    for (const iface of interfaceTotals(specFor(item))) {
+    for (const iface of interfaceTotals(specFor(item), item)) {
       const names = [];
       for (let index = 0; index < iface.port_count; index += 1) {
         names.push(byType[iface.interface_type]?.[index] || "");
@@ -2222,30 +3198,45 @@ function bindConnectionPanel(item, editing) {
     if (errorEl) errorEl.textContent = "";
     const rows = [...interfaceForm.querySelectorAll(".interface-edit-row")];
     const interfaces = rows.map((row) => ({
-      interface_type: row.querySelector(".interface-type-input").value.trim(),
+      interface_type: composeInterfaceType(
+        row.querySelector(".interface-type-input").value.trim(),
+        row.querySelector(".interface-direction-input")?.value || "",
+      ),
       port_count: Number(row.querySelector(".interface-count-input").value),
     }));
     const submitButton = interfaceForm.querySelector("[type='submit']");
     submitButton.disabled = true;
     try {
       const result = await api(
-        `/api/equipment-types/${encodeURIComponent(item.spec_key)}/interfaces`,
+        `/api/equipment/${item.db_id}/interfaces`,
         {
           method: "PUT",
           body: JSON.stringify({ interfaces }),
         },
       );
-      for (const key of result.spec_keys) {
-        const type = state.typeByKey.get(key);
-        if (type) {
-          type.interfaces = result.interfaces.map((entry) => ({ ...entry }));
+      if (result.equipment) {
+        Object.assign(item, result.equipment);
+        const stored = state.items.find((entry) => entry.db_id === item.db_id);
+        if (stored && stored !== item) {
+          Object.assign(stored, result.equipment);
+        }
+      } else {
+        item.interfaces = (result.interfaces || []).map((entry) => ({ ...entry }));
+        const stored = state.items.find((entry) => entry.db_id === item.db_id);
+        if (stored && stored !== item) {
+          stored.interfaces = item.interfaces.map((entry) => ({ ...entry }));
         }
       }
+      state.connectionNamesByType = {};
       state.connectionEditing = false;
+      item._portLinksLoaded = false;
+      item._portLinks = [];
       await loadEquipmentConnections(item);
+      loadAllLinks();
       setStatus(
-        `${specFor(item)?.name || item.spec_key} 연결 정보를 저장했습니다.`,
+        `${item.equipment_name || item.equipment_id} 연결 정보를 저장했습니다.`,
       );
+      submitButton.disabled = false;
     } catch (error) {
       if (errorEl) errorEl.textContent = error.message;
       submitButton.disabled = false;
@@ -2633,6 +3624,7 @@ function renderInspector(editing = state.inspectorEditing) {
       <div class="info-divider"></div>
       ${pathHtml}
     `;
+    bindPathTraceControls();
     return;
   }
 
@@ -3103,10 +4095,78 @@ async function saveItem(item) {
         locked: item.locked,
       }),
     });
-    Object.assign(item, updated);
+    applyGeometryUpdate(item, updated);
   } catch (error) {
     setStatus(`저장 오류: ${error.message}`);
   }
+}
+
+function applyGeometryUpdate(item, updated) {
+  if (!updated) return;
+  if (updated.world_x != null) item.world_x = updated.world_x;
+  if (updated.world_y != null) item.world_y = updated.world_y;
+  if (updated.layout_width != null) item.layout_width = updated.layout_width;
+  if (updated.layout_height != null) item.layout_height = updated.layout_height;
+  if (updated.locked != null) item.locked = Boolean(updated.locked);
+}
+
+async function saveItemsGeometry(items) {
+  const unique = [];
+  const seen = new Set();
+  for (const item of items) {
+    if (!item || seen.has(item.db_id)) continue;
+    seen.add(item.db_id);
+    unique.push(item);
+  }
+  if (!unique.length) return;
+  if (unique.length === 1) {
+    await saveItem(unique[0]);
+    return;
+  }
+  try {
+    const updated = await api("/api/equipment/batch-geometry", {
+      method: "PATCH",
+      body: JSON.stringify({
+        items: unique.map((item) => ({
+          db_id: item.db_id,
+          world_x: item.world_x,
+          world_y: item.world_y,
+          layout_width: item.layout_width,
+          layout_height: item.layout_height,
+          locked: item.locked,
+        })),
+      }),
+    });
+    const byId = new Map(
+      (Array.isArray(updated) ? updated : []).map((row) => [row.db_id, row]),
+    );
+    for (const item of unique) {
+      applyGeometryUpdate(item, byId.get(item.db_id));
+    }
+  } catch (error) {
+    setStatus(`저장 오류: ${error.message}`);
+  }
+}
+
+function queueGeometrySave(items) {
+  for (const item of items) {
+    if (item) pendingGeometrySaves.set(item.db_id, item);
+  }
+  if (geometrySaveTimer) window.clearTimeout(geometrySaveTimer);
+  geometrySaveTimer = window.setTimeout(async () => {
+    geometrySaveTimer = 0;
+    const pending = [...pendingGeometrySaves.values()];
+    pendingGeometrySaves.clear();
+    await saveItemsGeometry(pending);
+  }, 120);
+}
+
+function pruneLinksForEquipmentIds(ids) {
+  if (!ids?.size) return;
+  state.links = (state.links || []).filter(
+    (link) =>
+      !ids.has(link.a_equipment_db_id) && !ids.has(link.b_equipment_db_id),
+  );
 }
 
 async function deleteSelected() {
@@ -3114,10 +4174,16 @@ async function deleteSelected() {
   if (!items.length) return;
   if (!confirm(`${items.length}개 장비를 삭제하시겠습니까?`)) return;
   try {
-    await Promise.all(
-      items.map((item) => api(`/api/equipment/${item.db_id}`, { method: "DELETE" })),
-    );
-    const ids = new Set(items.map((item) => item.db_id));
+    const dbIds = items.map((item) => item.db_id);
+    if (dbIds.length === 1) {
+      await api(`/api/equipment/${dbIds[0]}`, { method: "DELETE" });
+    } else {
+      await api("/api/equipment/batch-delete", {
+        method: "POST",
+        body: JSON.stringify({ db_ids: dbIds }),
+      });
+    }
+    const ids = new Set(dbIds);
     // 프레임 삭제 시 서버가 자식 카드도 함께 소프트 삭제하므로 로컬에서도 제거
     for (const item of items) {
       for (const child of state.items) {
@@ -3126,8 +4192,9 @@ async function deleteSelected() {
     }
     pushUndo({ type: "delete", dbIds: [...ids] });
     state.items = state.items.filter((item) => !ids.has(item.db_id));
+    pruneLinksForEquipmentIds(ids);
     clearSelection();
-    loadAllLinks();
+    draw();
     setStatus(`${items.length}개 장비를 삭제했습니다.`);
   } catch (error) {
     alert(error.message);
@@ -3168,6 +4235,8 @@ async function pasteModuleCardIntoSlot(frame, slotIndex) {
     }
     await loadFrameSlots(frame);
     if (pasted[0]) setSelection(new Set([pasted[0].db_id]));
+    const pastedIds = pasted.map((card) => card.db_id);
+    if (pastedIds.length) pushUndo({ type: "paste", dbIds: pastedIds });
     setStatus(
       `${source.equipment_name || "카드"}을(를) 슬롯 ${slotIndex}에 붙여넣었습니다.`,
     );
@@ -3282,6 +4351,8 @@ async function pasteEquipment() {
     }
     const cardPasteCount = cardPastedOnly.length;
     const topPasteCount = pasted.length - cardPasteCount;
+    const pastedIds = pasted.map((item) => item.db_id);
+    if (pastedIds.length) pushUndo({ type: "paste", dbIds: pastedIds });
     if (cardPasteCount && !topPasteCount) {
       setStatus(
         `${cardPasteCount}개 모듈 카드를 빈 슬롯에 붙여넣었습니다.`,
@@ -3298,10 +4369,49 @@ async function pasteEquipment() {
   }
 }
 
+function collectEquipmentTreeIds(rootIds) {
+  const ids = new Set(rootIds);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const item of state.items) {
+      if (
+        item.parent_equipment_id
+        && ids.has(item.parent_equipment_id)
+        && !ids.has(item.db_id)
+      ) {
+        ids.add(item.db_id);
+        changed = true;
+      }
+    }
+  }
+  return ids;
+}
+
+async function removeEquipmentIds(dbIds) {
+  const ids = collectEquipmentTreeIds(dbIds);
+  const roots = [...ids].filter((id) => {
+    const item = state.items.find((entry) => entry.db_id === id);
+    return !item?.parent_equipment_id || !ids.has(item.parent_equipment_id);
+  });
+  if (!roots.length) return ids;
+  if (roots.length === 1) {
+    await api(`/api/equipment/${roots[0]}`, { method: "DELETE" });
+  } else {
+    await api("/api/equipment/batch-delete", {
+      method: "POST",
+      body: JSON.stringify({ db_ids: roots }),
+    });
+  }
+  state.items = state.items.filter((item) => !ids.has(item.db_id));
+  pruneLinksForEquipmentIds(ids);
+  return ids;
+}
+
 async function undoLastAction() {
   const action = state.undoStack.pop();
   if (!action) {
-    setStatus("되돌릴 이동 또는 삭제 작업이 없습니다.");
+    setStatus("되돌릴 작업이 없습니다.");
     return;
   }
   try {
@@ -3321,6 +4431,13 @@ async function undoLastAction() {
       renderInspector();
       draw();
       setStatus(`${restored.length}개 장비의 이동을 취소했습니다.`);
+      return;
+    }
+    if (action.type === "paste") {
+      const removed = await removeEquipmentIds(action.dbIds || []);
+      clearSelection();
+      draw();
+      setStatus(`${removed.size}개 장비의 붙여넣기를 취소했습니다.`);
       return;
     }
     if (action.type === "delete") {
@@ -3458,7 +4575,7 @@ async function loadAllLinks() {
     state.links = [];
   }
   const items = selectedItemsOrdered();
-  if (items.length === 2) updatePathTrace(items);
+  if (items.length >= 2) updatePathTrace(items);
   draw();
 }
 
@@ -3500,7 +4617,7 @@ async function fetchConnectionNames(item) {
 
 function portRowsHtml(owner, byType, groupLabel = "") {
   const spec = specFor(owner);
-  const ifaces = interfaceTotals(spec);
+  const ifaces = interfaceTotals(spec, owner);
   const draft = state.linkDraft;
   const rows = [];
   if (groupLabel) {
@@ -3526,7 +4643,7 @@ function portRowsHtml(owner, byType, groupLabel = "") {
                   data-connection-name="${escapeHtml(name)}">
             <span class="port-menu-label">${escapeHtml(
               formatPortLabel(iface.interface_type, index, name),
-            )}</span>
+            )}${iface.direction ? ` (${iface.direction === "input" ? "IN←" : "OUT→"})` : ""}</span>
             ${peer ? `<span class="port-menu-peer">→ ${escapeHtml(
               peer.equipmentName || peer.equipmentId,
             )} / ${escapeHtml(
@@ -3766,7 +4883,7 @@ window.addEventListener("mousemove", (event) => {
     state.offsetX += point.x - state.pan.last.x;
     state.offsetY += point.y - state.pan.last.y;
     state.pan.last = point;
-    draw();
+    scheduleDraw();
     return;
   }
   if (state.drag) {
@@ -3779,14 +4896,13 @@ window.addEventListener("mousemove", (event) => {
       }
       state.drag.changed = true;
       state.drag.last = point;
-      renderInspector();
-      draw();
+      scheduleDraw();
     }
     return;
   }
   if (state.marquee) {
     state.marquee.current = point;
-    draw();
+    scheduleDraw();
     return;
   }
   if (state.cableMode) {
@@ -3809,14 +4925,15 @@ window.addEventListener("mouseup", () => {
   if (state.pan) {
     state.pan = null;
     board.classList.remove("panning");
+    draw();
   }
   if (state.drag) {
     if (state.drag.changed) {
       for (const item of state.drag.items) {
         if (isRackKey(item.spec_key)) snapRackItem(item);
         else snapItemToRack(item);
-        saveItem(item);
       }
+      saveItemsGeometry(state.drag.items);
       recordMoveUndo(state.drag.before, state.drag.items);
       draw();
     }
@@ -3866,8 +4983,8 @@ contextMenu.addEventListener("click", async (event) => {
     const locked = !items.every((item) => item.locked);
     for (const item of items) {
       item.locked = locked;
-      saveItem(item);
     }
+    saveItemsGeometry(items);
     setSelection(new Set(state.selected));
   } else if (action === "move") {
     board.focus();
@@ -3966,16 +5083,15 @@ document.addEventListener("keydown", (event) => {
       if (rack && dy) {
         item.world_y += dy * rackMetrics(rack).unitHeight;
       }
-      if (snapItemToRack(item)) saveItem(item);
+      snapItemToRack(item);
     } else {
       item.world_x += dx * 2 / state.zoom;
       item.world_y += dy * 2 / state.zoom;
-      saveItem(item);
     }
   }
   recordMoveUndo(before, items);
-  renderInspector();
-  draw();
+  queueGeometrySave(items);
+  scheduleDraw();
 });
 
 document.getElementById("zoom-in").addEventListener("click", () => {

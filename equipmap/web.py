@@ -14,6 +14,7 @@ from flask import Flask, jsonify, render_template, request, send_from_directory
 from equipmap.database import (
     DEFAULT_DB_PATH,
     EquipmentConnectionRecord,
+    EquipmentInterfaceRecord,
     EquipmentLogRecord,
     EquipmentPortLinkRecord,
     EquipmentRecord,
@@ -35,7 +36,24 @@ ASSET_DIR = PACKAGE_DIR / "assets"
 EQUIPMENT_IMAGE_DIR = PACKAGE_DIR.parent / "equipment_images"
 
 
-def _equipment_payload(record: EquipmentRecord) -> dict:
+def _interface_payload(
+    item: EquipmentInterfaceRecord | EquipmentTypeInterfaceRecord,
+) -> dict:
+    return {
+        "interface_id": item.interface_id,
+        "group_name": item.group_name,
+        "interface_type": item.interface_type,
+        "port_count": item.port_count,
+        "sort_order": item.sort_order,
+    }
+
+
+def _equipment_payload(
+    record: EquipmentRecord,
+    interfaces: list[
+        EquipmentInterfaceRecord | EquipmentTypeInterfaceRecord
+    ] | None = None,
+) -> dict:
     payload = asdict(record)
     payload["photo_url"] = (
         f"/equipment-images/{Path(record.photo_path).name}"
@@ -44,7 +62,21 @@ def _equipment_payload(record: EquipmentRecord) -> dict:
     )
     payload["parent_equipment_id"] = record.parent_equipment_id
     payload["slot_index"] = record.slot_index
+    payload["interfaces"] = [
+        _interface_payload(item) for item in (interfaces or [])
+    ]
     return payload
+
+
+def _equipment_geometry_payload(record: EquipmentRecord) -> dict:
+    return {
+        "db_id": record.db_id,
+        "world_x": record.world_x,
+        "world_y": record.world_y,
+        "layout_width": record.layout_width,
+        "layout_height": record.layout_height,
+        "locked": record.locked,
+    }
 
 
 def _equipment_type_payload(
@@ -58,16 +90,23 @@ def _equipment_type_payload(
         ),
         "image_url": f"/assets/{Path(record.image_path).name}",
         "interfaces": [
-            {
-                "interface_id": item.interface_id,
-                "group_name": item.group_name,
-                "interface_type": item.interface_type,
-                "port_count": item.port_count,
-                "sort_order": item.sort_order,
-            }
-            for item in (interfaces or [])
+            _interface_payload(item) for item in (interfaces or [])
         ],
     }
+
+
+def _equipment_with_interfaces(
+    repository: EquipmentRepository,
+    record: EquipmentRecord,
+    own_by_id: dict[int, list[EquipmentInterfaceRecord]] | None = None,
+    type_by_key: dict[str, list[EquipmentTypeInterfaceRecord]] | None = None,
+) -> dict:
+    """장비 payload의 interfaces는 인스턴스 전용 설정만 포함한다."""
+    if own_by_id is not None:
+        own = own_by_id.get(record.db_id) or []
+    else:
+        own = repository.list_equipment_interfaces(record.db_id)
+    return _equipment_payload(record, own)
 
 
 def _equipment_types_payload(
@@ -127,6 +166,7 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> Flask:
             request.path == "/"
             or request.path.startswith("/static/")
             or request.path.startswith("/equipment-images/")
+            or request.path.startswith("/api/")
         ):
             response.headers["Cache-Control"] = "no-store, max-age=0"
         return response
@@ -245,8 +285,17 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> Flask:
 
     @app.get("/api/equipment")
     def equipment_list():
+        records = repository.list_all()
+        own_by_id = repository.list_all_equipment_interfaces()
         return jsonify(
-            [_equipment_payload(record) for record in repository.list_all()]
+            [
+                _equipment_with_interfaces(
+                    repository,
+                    record,
+                    own_by_id=own_by_id,
+                )
+                for record in records
+            ]
         )
 
     @app.post("/api/equipment")
@@ -273,9 +322,25 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> Flask:
                 layout_height=float(values.get("layout_height", spec.height)),
                 locked=bool(values.get("locked", False)),
             )
+            vendor = str(values.get("equipment_vendor", "")).strip()
+            model = str(values.get("equipment_model", "")).strip()
+            asset_number = str(values.get("asset_number", "")).strip()
+            serial_number = str(values.get("serial_number", "")).strip()
+            if vendor or model or asset_number or serial_number:
+                repository.update_details(
+                    record.db_id,
+                    equipment_name=record.equipment_name,
+                    equipment_vendor=vendor,
+                    equipment_model=model,
+                    asset_number=asset_number,
+                    serial_number=serial_number,
+                )
+                refreshed = repository.get(record.db_id)
+                if refreshed is not None:
+                    record = refreshed
         except (TypeError, ValueError) as error:
             return jsonify({"error": str(error)}), 400
-        return jsonify(_equipment_payload(record)), 201
+        return jsonify(_equipment_with_interfaces(repository, record)), 201
 
     @app.post("/api/equipment/clone")
     def equipment_clone():
@@ -357,23 +422,27 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> Flask:
         if not created_records:
             return jsonify({"error": "복사할 장비를 찾을 수 없습니다."}), 404
         return jsonify(
-            [_equipment_payload(record) for record in created_records]
+            [
+                _equipment_with_interfaces(repository, record)
+                for record in created_records
+            ]
         ), 201
 
     @app.patch("/api/equipment/<int:db_id>")
     def equipment_update(db_id: int):
-        current = next(
-            (
-                record
-                for record in repository.list_all()
-                if record.db_id == db_id
-            ),
-            None,
-        )
+        current = repository.get(db_id)
         if current is None:
             return jsonify({"error": "장비를 찾을 수 없습니다."}), 404
 
         values = request.get_json(silent=True) or {}
+        detail_keys = (
+            "equipment_name",
+            "equipment_vendor",
+            "equipment_model",
+            "asset_number",
+            "serial_number",
+        )
+        geometry_only = not any(key in values for key in detail_keys)
         try:
             repository.update_state(
                 db_id,
@@ -389,6 +458,12 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> Flask:
             )
         except (TypeError, ValueError) as error:
             return jsonify({"error": str(error)}), 400
+
+        if geometry_only:
+            updated = repository.get(db_id)
+            if updated is None:
+                return jsonify({"error": "장비를 찾을 수 없습니다."}), 404
+            return jsonify(_equipment_geometry_payload(updated))
 
         new_vendor = str(
             values.get("equipment_vendor", current.equipment_vendor)
@@ -427,12 +502,106 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> Flask:
                 photo_source_url="",
                 photo_query="",
             )
-        updated = next(
-            record
-            for record in repository.list_all()
-            if record.db_id == db_id
+        updated = repository.get(db_id)
+        if updated is None:
+            return jsonify({"error": "장비를 찾을 수 없습니다."}), 404
+        return jsonify(_equipment_with_interfaces(repository, updated))
+
+    @app.patch("/api/equipment/batch-geometry")
+    def equipment_batch_geometry():
+        values = request.get_json(silent=True) or {}
+        raw_items = values.get("items") or []
+        if not isinstance(raw_items, list) or not raw_items:
+            return jsonify({"error": "저장할 장비가 없습니다."}), 400
+        if len(raw_items) > 200:
+            return jsonify({"error": "한 번에 최대 200대까지 저장할 수 있습니다."}), 400
+        updated_payloads = []
+        try:
+            for entry in raw_items:
+                db_id = int(entry.get("db_id"))
+                current = repository.get(db_id)
+                if current is None:
+                    return jsonify(
+                        {"error": f"장비를 찾을 수 없습니다. (id={db_id})"}
+                    ), 404
+                repository.update_state(
+                    db_id,
+                    world_x=float(entry.get("world_x", current.world_x)),
+                    world_y=float(entry.get("world_y", current.world_y)),
+                    layout_width=float(
+                        entry.get("layout_width", current.layout_width)
+                    ),
+                    layout_height=float(
+                        entry.get("layout_height", current.layout_height)
+                    ),
+                    locked=bool(entry.get("locked", current.locked)),
+                )
+                updated = repository.get(db_id)
+                if updated is not None:
+                    updated_payloads.append(
+                        _equipment_geometry_payload(updated)
+                    )
+        except (TypeError, ValueError, KeyError) as error:
+            return jsonify({"error": str(error)}), 400
+        return jsonify(updated_payloads)
+
+    @app.post("/api/equipment/batch-delete")
+    def equipment_batch_delete():
+        values = request.get_json(silent=True) or {}
+        raw_ids = values.get("db_ids") or []
+        if not isinstance(raw_ids, list) or not raw_ids:
+            return jsonify({"error": "삭제할 장비가 없습니다."}), 400
+        if len(raw_ids) > 200:
+            return jsonify({"error": "한 번에 최대 200대까지 삭제할 수 있습니다."}), 400
+        deleted = 0
+        try:
+            for raw_id in raw_ids:
+                db_id = int(raw_id)
+                if repository.get(db_id) is None:
+                    continue
+                repository.delete(db_id)
+                deleted += 1
+        except (TypeError, ValueError) as error:
+            return jsonify({"error": str(error)}), 400
+        return jsonify({"deleted": deleted})
+
+    @app.get("/api/equipment/<int:db_id>/interfaces")
+    def equipment_interfaces_get(db_id: int):
+        record = repository.get(db_id)
+        if record is None:
+            return jsonify({"error": "장비를 찾을 수 없습니다."}), 404
+        interfaces = repository.resolve_equipment_interfaces(record)
+        return jsonify(
+            {
+                "equipment_db_id": db_id,
+                "interfaces": [_interface_payload(item) for item in interfaces],
+            }
         )
-        return jsonify(_equipment_payload(updated))
+
+    @app.put("/api/equipment/<int:db_id>/interfaces")
+    def equipment_interfaces_update(db_id: int):
+        values = request.get_json(silent=True) or {}
+        raw_interfaces = values.get("interfaces")
+        if not isinstance(raw_interfaces, list):
+            return jsonify({"error": "인터페이스 목록이 올바르지 않습니다."}), 400
+        if not all(isinstance(item, dict) for item in raw_interfaces):
+            return jsonify({"error": "인터페이스 항목이 올바르지 않습니다."}), 400
+        try:
+            interfaces = repository.replace_equipment_interfaces(
+                db_id,
+                raw_interfaces,
+            )
+        except (TypeError, ValueError) as error:
+            return jsonify({"error": str(error)}), 400
+        record = repository.get(db_id)
+        if record is None:
+            return jsonify({"error": "장비를 찾을 수 없습니다."}), 404
+        return jsonify(
+            {
+                "equipment": _equipment_payload(record, interfaces),
+                "interfaces": [_interface_payload(item) for item in interfaces],
+            }
+        )
 
     @app.post("/api/equipment/<int:db_id>/search-image")
     def equipment_search_image(db_id: int):
@@ -481,7 +650,7 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> Flask:
         )
         return jsonify(
             {
-                **_equipment_payload(updated),
+                **_equipment_with_interfaces(repository, updated),
                 "photo_title": saved.title,
                 "photo_source_label": saved.source_label,
             }
@@ -523,7 +692,7 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> Flask:
         )
         if updated is None:
             return jsonify({"error": "장비를 찾을 수 없습니다."}), 404
-        return jsonify(_equipment_payload(updated))
+        return jsonify(_equipment_with_interfaces(repository, updated))
 
     @app.post("/api/equipment/<int:db_id>/upload-image")
     def equipment_upload_image(db_id: int):
@@ -561,7 +730,7 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> Flask:
             for record in repository.list_all()
             if record.db_id == db_id
         )
-        return jsonify(_equipment_payload(updated))
+        return jsonify(_equipment_with_interfaces(repository, updated))
 
     @app.put("/api/equipment/<int:db_id>/slots")
     def equipment_slots_update(db_id: int):
@@ -575,7 +744,7 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> Flask:
             return jsonify({"error": str(error)}), 400
         return jsonify(
             {
-                "frame": _equipment_payload(record),
+                "frame": _equipment_with_interfaces(repository, record),
                 "slot_count": repository.frame_slot_count_for(record),
             }
         )
@@ -600,7 +769,11 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> Flask:
             slots.append(
                 {
                     "slot_index": index,
-                    "card": _equipment_payload(card) if card else None,
+                    "card": (
+                        _equipment_with_interfaces(repository, card)
+                        if card
+                        else None
+                    ),
                 }
             )
         return jsonify(
@@ -623,7 +796,7 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> Flask:
             )
         except (TypeError, ValueError) as error:
             return jsonify({"error": str(error)}), 400
-        return jsonify(_equipment_payload(record)), 201
+        return jsonify(_equipment_with_interfaces(repository, record)), 201
 
     @app.delete("/api/equipment/<int:db_id>/slots/<int:slot_index>")
     def equipment_slot_unmount(db_id: int, slot_index: int):
@@ -805,7 +978,12 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> Flask:
                 restored.append(record)
         if not restored:
             return jsonify({"error": "복원할 장비를 찾을 수 없습니다."}), 404
-        return jsonify([_equipment_payload(record) for record in restored])
+        return jsonify(
+            [
+                _equipment_with_interfaces(repository, record)
+                for record in restored
+            ]
+        )
 
     return app
 

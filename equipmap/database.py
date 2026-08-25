@@ -117,6 +117,34 @@ DEFAULT_EQUIPMENT_TYPES = (
         400,
         "PDU",
     ),
+    (
+        "patch_1ru",
+        "rack",
+        "설치물",
+        "PATCH",
+        1,
+        "equipmap/assets/server_rack_icon.png",
+        "equipmap/assets/solid_rack_device.png",
+        "equipmap/assets/solid_rack_device.png",
+        RACK_MOUNT_WIDTH,
+        RACK_RU_HEIGHT,
+        450,
+        "PATCH",
+    ),
+    (
+        "patch_2ru",
+        "rack",
+        "설치물",
+        "PATCH",
+        2,
+        "equipmap/assets/server_rack_icon.png",
+        "equipmap/assets/solid_rack_device.png",
+        "equipmap/assets/solid_rack_device.png",
+        RACK_MOUNT_WIDTH,
+        RACK_RU_HEIGHT * 2,
+        451,
+        "PATCH",
+    ),
 )
 
 DEFAULT_EQUIPMENT_TYPES += tuple(
@@ -170,12 +198,18 @@ DEFAULT_INTERFACE_PROFILES: dict[str, tuple[tuple[str, str, int, int], ...]] = {
         ("전원", "Power", 8, 10),
         ("네트워크", "Ethernet", 1, 20),
     ),
+    "PATCH": (
+        # 같은 번호 INPUT↔OUTPUT 이 passthrough
+        ("영상", "BNC INPUT", 16, 10),
+        ("영상", "BNC OUTPUT", 16, 20),
+    ),
     "VMU": (
-        ("영상", "BNC", 8, 10),
-        ("음성", "XLR", 4, 20),
-        ("네트워크", "Ethernet", 2, 30),
-        ("제어", "Serial", 1, 40),
-        ("전원", "Power", 1, 50),
+        ("영상", "BNC INPUT", 4, 10),
+        ("영상", "BNC OUTPUT", 4, 20),
+        ("음성", "XLR", 4, 30),
+        ("네트워크", "Ethernet", 2, 40),
+        ("제어", "Serial", 1, 50),
+        ("전원", "Power", 1, 60),
     ),
     # 프레임(케이스) 자체는 전원/제어 위주. 신호 포트는 내부 카드가 담당.
     "MODULE_FRAME": (
@@ -184,42 +218,50 @@ DEFAULT_INTERFACE_PROFILES: dict[str, tuple[tuple[str, str, int, int], ...]] = {
         ("제어", "Serial", 1, 30),
     ),
     "CARD_DA": (
-        ("영상", "BNC", 8, 10),
-        ("전원", "Power", 1, 20),
+        ("영상", "BNC INPUT", 1, 10),
+        ("영상", "BNC OUTPUT", 7, 20),
+        ("전원", "Power", 1, 30),
     ),
     "CARD_EMBED": (
-        ("영상", "BNC", 4, 10),
-        ("음성", "XLR", 4, 20),
-        ("전원", "Power", 1, 30),
+        ("영상", "BNC INPUT", 2, 10),
+        ("영상", "BNC OUTPUT", 2, 20),
+        ("음성", "XLR", 4, 30),
+        ("전원", "Power", 1, 40),
     ),
     "CARD_DEEMBED": (
-        ("영상", "BNC", 4, 10),
-        ("음성", "XLR", 4, 20),
-        ("전원", "Power", 1, 30),
+        ("영상", "BNC INPUT", 2, 10),
+        ("영상", "BNC OUTPUT", 2, 20),
+        ("음성", "XLR", 4, 30),
+        ("전원", "Power", 1, 40),
     ),
     "CARD_CONV": (
-        ("영상", "BNC", 2, 10),
-        ("영상", "HDMI", 2, 20),
-        ("전원", "Power", 1, 30),
+        ("영상", "BNC INPUT", 1, 10),
+        ("영상", "BNC OUTPUT", 1, 20),
+        ("영상", "HDMI INPUT", 1, 30),
+        ("영상", "HDMI OUTPUT", 1, 40),
+        ("전원", "Power", 1, 50),
     ),
     "CARD_PROC": (
-        ("영상", "BNC", 4, 10),
-        ("네트워크", "Ethernet", 1, 20),
-        ("전원", "Power", 1, 30),
+        ("영상", "BNC INPUT", 2, 10),
+        ("영상", "BNC OUTPUT", 2, 20),
+        ("네트워크", "Ethernet", 1, 30),
+        ("전원", "Power", 1, 40),
     ),
     "CARD_ROUTER": (
-        ("영상", "BNC", 16, 10),
-        ("제어", "Serial", 1, 20),
-        ("전원", "Power", 1, 30),
+        ("영상", "BNC INPUT", 8, 10),
+        ("영상", "BNC OUTPUT", 8, 20),
+        ("제어", "Serial", 1, 30),
+        ("전원", "Power", 1, 40),
     ),
     "CARD": (
-        ("영상", "BNC", 4, 10),
-        ("네트워크", "Ethernet", 1, 20),
-        ("전원", "Power", 1, 30),
+        ("영상", "BNC INPUT", 2, 10),
+        ("영상", "BNC OUTPUT", 2, 20),
+        ("네트워크", "Ethernet", 1, 30),
+        ("전원", "Power", 1, 40),
     ),
     "MONITOR": (
-        ("영상", "BNC", 2, 10),
-        ("영상", "HDMI", 1, 20),
+        ("영상", "BNC INPUT", 2, 10),
+        ("영상", "HDMI INPUT", 1, 20),
         ("음성", "XLR", 2, 30),
         ("네트워크", "Ethernet", 1, 40),
         ("전원", "Power", 1, 50),
@@ -232,13 +274,14 @@ DEFAULT_INTERFACE_PROFILES: dict[str, tuple[tuple[str, str, int, int], ...]] = {
         ("전원", "Power", 1, 50),
     ),
     "MEASURE_DEVICE": (
-        ("영상", "BNC", 4, 10),
-        ("네트워크", "Ethernet", 1, 20),
-        ("제어", "Serial", 1, 30),
-        ("전원", "Power", 1, 40),
+        ("영상", "BNC INPUT", 2, 10),
+        ("영상", "BNC OUTPUT", 2, 20),
+        ("네트워크", "Ethernet", 1, 30),
+        ("제어", "Serial", 1, 40),
+        ("전원", "Power", 1, 50),
     ),
     "SIGNAL_GENERATOR": (
-        ("영상", "BNC", 4, 10),
+        ("영상", "BNC OUTPUT", 4, 10),
         ("음성", "XLR", 2, 20),
         ("음성", "RCA", 2, 30),
         ("네트워크", "Ethernet", 1, 40),
@@ -354,6 +397,18 @@ class EquipmentLogRecord:
 class EquipmentTypeInterfaceRecord:
     interface_id: int
     spec_key: str
+    group_name: str
+    interface_type: str
+    port_count: int
+    sort_order: int
+
+
+@dataclass(frozen=True)
+class EquipmentInterfaceRecord:
+    """장비 인스턴스별 연결(인터페이스) 정의."""
+
+    interface_id: int
+    equipment_db_id: int
     group_name: str
     interface_type: str
     port_count: int
@@ -673,6 +728,31 @@ class EquipmentRepository:
             )
             connection.execute(
                 """
+                CREATE TABLE IF NOT EXISTS equipment_interfaces (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    equipment_id INTEGER NOT NULL,
+                    group_name TEXT NOT NULL DEFAULT '기타',
+                    interface_type TEXT NOT NULL,
+                    port_count INTEGER NOT NULL DEFAULT 1
+                        CHECK (port_count >= 1),
+                    sort_order INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(equipment_id, interface_type),
+                    FOREIGN KEY (equipment_id) REFERENCES equipment(id)
+                        ON DELETE CASCADE
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_equipment_interfaces_equipment
+                ON equipment_interfaces(equipment_id, sort_order, id)
+                """
+            )
+            connection.execute("DROP TABLE IF EXISTS equipment_catalog")
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS equipment_port_links (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     a_equipment_id INTEGER NOT NULL,
@@ -709,6 +789,67 @@ class EquipmentRepository:
                 """
             )
             self._seed_default_interfaces(connection)
+            self._upgrade_legacy_interface_profiles(connection)
+
+    @staticmethod
+    def _upgrade_legacy_interface_profiles(
+        connection: sqlite3.Connection,
+    ) -> None:
+        """단일 BNC 등 구형 기본 인터페이스를 최신 INPUT/OUTPUT 프로파일로 갱신."""
+        rows = connection.execute(
+            """
+            SELECT spec_key, id_prefix
+            FROM equipment_types
+            WHERE active = 1
+            """
+        ).fetchall()
+        for row in rows:
+            id_prefix = str(row["id_prefix"])
+            profile = DEFAULT_INTERFACE_PROFILES.get(id_prefix)
+            if not profile:
+                continue
+            profile_types = {iface[1] for iface in profile}
+            if not any(
+                "INPUT" in iface_type or "OUTPUT" in iface_type
+                for iface_type in profile_types
+            ):
+                continue
+            spec_key = str(row["spec_key"])
+            existing = connection.execute(
+                """
+                SELECT interface_type
+                FROM equipment_type_interfaces
+                WHERE spec_key = ?
+                """,
+                (spec_key,),
+            ).fetchall()
+            if not existing:
+                continue
+            types = {str(item["interface_type"]) for item in existing}
+            if types != {"BNC"}:
+                continue
+            connection.execute(
+                "DELETE FROM equipment_type_interfaces WHERE spec_key = ?",
+                (spec_key,),
+            )
+            connection.executemany(
+                """
+                INSERT INTO equipment_type_interfaces (
+                    spec_key, group_name, interface_type, port_count, sort_order
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        spec_key,
+                        group_name,
+                        interface_type,
+                        int(port_count),
+                        int(sort_order),
+                    )
+                    for group_name, interface_type, port_count, sort_order in profile
+                ],
+            )
 
     @staticmethod
     def _seed_default_interfaces(connection: sqlite3.Connection) -> None:
@@ -1693,6 +1834,166 @@ class EquipmentRepository:
             result.setdefault(record.spec_key, []).append(record)
         return result
 
+    def list_equipment_interfaces(
+        self,
+        equipment_db_id: int,
+    ) -> list[EquipmentInterfaceRecord]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM equipment_interfaces
+                WHERE equipment_id = ?
+                ORDER BY sort_order, id
+                """,
+                (equipment_db_id,),
+            ).fetchall()
+        return [self._to_equipment_interface_record(row) for row in rows]
+
+    def list_all_equipment_interfaces(
+        self,
+    ) -> dict[int, list[EquipmentInterfaceRecord]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM equipment_interfaces
+                ORDER BY equipment_id, sort_order, id
+                """
+            ).fetchall()
+        result: dict[int, list[EquipmentInterfaceRecord]] = {}
+        for row in rows:
+            record = self._to_equipment_interface_record(row)
+            result.setdefault(record.equipment_db_id, []).append(record)
+        return result
+
+    def resolve_equipment_interfaces(
+        self,
+        equipment: EquipmentRecord,
+    ) -> list[EquipmentInterfaceRecord] | list[EquipmentTypeInterfaceRecord]:
+        """인스턴스 정의가 있으면 사용하고, 없으면 종류 기본값을 반환."""
+        own = self.list_equipment_interfaces(equipment.db_id)
+        if own:
+            return own
+        return self.list_type_interfaces([equipment.spec_key]).get(
+            equipment.spec_key,
+            [],
+        )
+
+    def replace_equipment_interfaces(
+        self,
+        equipment_db_id: int,
+        interfaces: list[dict[str, object]],
+    ) -> list[EquipmentInterfaceRecord]:
+        """해당 장비만의 연결 종류/수량을 저장한다."""
+        if len(interfaces) > 50:
+            raise ValueError("인터페이스는 최대 50개까지 등록할 수 있습니다.")
+        normalized: list[tuple[str, int]] = []
+        seen_types: set[str] = set()
+        for item in interfaces:
+            interface_type = str(item.get("interface_type", "")).strip()
+            if not interface_type or len(interface_type) > 40:
+                raise ValueError("인터페이스 종류는 1~40자로 입력해주세요.")
+            lowered = interface_type.casefold()
+            if lowered in seen_types:
+                raise ValueError("같은 인터페이스 종류를 중복 등록할 수 없습니다.")
+            seen_types.add(lowered)
+            try:
+                port_count = int(item.get("port_count", 0))
+            except (TypeError, ValueError) as error:
+                raise ValueError("연결 수량은 숫자로 입력해주세요.") from error
+            if not 1 <= port_count <= 9999:
+                raise ValueError("연결 수량은 1~9999 사이여야 합니다.")
+            normalized.append((interface_type, port_count))
+
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT e.id, t.category_key, t.id_prefix
+                FROM equipment e
+                JOIN equipment_types t ON t.spec_key = e.spec_key
+                WHERE e.id = ? AND e.deleted = 0 AND t.active = 1
+                """,
+                (equipment_db_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("장비를 찾을 수 없습니다.")
+            allowed = str(row["category_key"]) in {
+                "broadcast_equipment",
+                "module_card",
+            } or str(row["id_prefix"]) == "PATCH"
+            if not allowed:
+                raise ValueError(
+                    "방송 장비/모듈 카드/PATCH의 연결 정보만 수정할 수 있습니다."
+                )
+            connection.execute(
+                "DELETE FROM equipment_interfaces WHERE equipment_id = ?",
+                (equipment_db_id,),
+            )
+            if normalized:
+                connection.executemany(
+                    """
+                    INSERT INTO equipment_interfaces (
+                        equipment_id, group_name, interface_type,
+                        port_count, sort_order
+                    )
+                    VALUES (?, '기타', ?, ?, ?)
+                    """,
+                    [
+                        (
+                            equipment_db_id,
+                            interface_type,
+                            port_count,
+                            (index + 1) * 10,
+                        )
+                        for index, (interface_type, port_count) in enumerate(
+                            normalized
+                        )
+                    ],
+                )
+            new_types = {interface_type for interface_type, _ in normalized}
+            if new_types:
+                placeholders = ", ".join("?" for _ in new_types)
+                connection.execute(
+                    f"""
+                    DELETE FROM equipment_connections
+                    WHERE equipment_id = ?
+                      AND interface_type NOT IN ({placeholders})
+                    """,
+                    (equipment_db_id, *new_types),
+                )
+                connection.execute(
+                    f"""
+                    DELETE FROM equipment_port_links
+                    WHERE (
+                        a_equipment_id = ?
+                        AND a_interface_type NOT IN ({placeholders})
+                    ) OR (
+                        b_equipment_id = ?
+                        AND b_interface_type NOT IN ({placeholders})
+                    )
+                    """,
+                    (
+                        equipment_db_id,
+                        *new_types,
+                        equipment_db_id,
+                        *new_types,
+                    ),
+                )
+            else:
+                connection.execute(
+                    "DELETE FROM equipment_connections WHERE equipment_id = ?",
+                    (equipment_db_id,),
+                )
+                connection.execute(
+                    """
+                    DELETE FROM equipment_port_links
+                    WHERE a_equipment_id = ? OR b_equipment_id = ?
+                    """,
+                    (equipment_db_id, equipment_db_id),
+                )
+        return self.list_equipment_interfaces(equipment_db_id)
+
     def replace_type_interfaces(
         self,
         spec_key: str,
@@ -1736,9 +2037,9 @@ class EquipmentRepository:
             if str(source["category_key"]) not in {
                 "broadcast_equipment",
                 "module_card",
-            }:
+            } and str(source["id_prefix"]) != "PATCH":
                 raise ValueError(
-                    "방송 장비/모듈 카드의 연결 정보만 수정할 수 있습니다."
+                    "방송 장비/모듈 카드/PATCH의 연결 정보만 수정할 수 있습니다."
                 )
 
             rows = connection.execute(
@@ -2029,6 +2330,11 @@ class EquipmentRepository:
                 """,
                 (target_db_id, source.db_id),
             )
+            self._copy_equipment_interfaces(
+                connection,
+                source.db_id,
+                target_db_id,
+            )
             connection.execute(
                 """
                 INSERT INTO equipment_logs (
@@ -2127,6 +2433,11 @@ class EquipmentRepository:
                 """,
                 (target_db_id, source_db_id),
             )
+            self._copy_equipment_interfaces(
+                connection,
+                source_db_id,
+                target_db_id,
+            )
             connection.execute(
                 """
                 INSERT INTO equipment_logs (
@@ -2216,6 +2527,11 @@ class EquipmentRepository:
                     """,
                     (child_db_id, int(child["id"])),
                 )
+                self._copy_equipment_interfaces(
+                    connection,
+                    int(child["id"]),
+                    child_db_id,
+                )
                 connection.execute(
                     """
                     INSERT INTO equipment_logs (
@@ -2275,6 +2591,11 @@ class EquipmentRepository:
                 ORDER BY id
                 """,
                 (target_db_id, source_db_id),
+            )
+            self._copy_equipment_interfaces(
+                connection,
+                source_db_id,
+                target_db_id,
             )
             connection.execute(
                 """
@@ -2614,10 +2935,70 @@ class EquipmentRepository:
         )
 
     @staticmethod
+    def _copy_equipment_interfaces(
+        connection: sqlite3.Connection,
+        source_db_id: int,
+        target_db_id: int,
+    ) -> None:
+        """소스 인스턴스 정의를 복사. 없으면 종류 기본값을 대상에 고정 저장."""
+        has_own = connection.execute(
+            """
+            SELECT 1 FROM equipment_interfaces
+            WHERE equipment_id = ?
+            LIMIT 1
+            """,
+            (source_db_id,),
+        ).fetchone()
+        if has_own is not None:
+            connection.execute(
+                """
+                INSERT INTO equipment_interfaces (
+                    equipment_id, group_name, interface_type, port_count,
+                    sort_order, created_at, updated_at
+                )
+                SELECT ?, group_name, interface_type, port_count,
+                       sort_order, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                FROM equipment_interfaces
+                WHERE equipment_id = ?
+                ORDER BY id
+                """,
+                (target_db_id, source_db_id),
+            )
+            return
+        connection.execute(
+            """
+            INSERT INTO equipment_interfaces (
+                equipment_id, group_name, interface_type, port_count,
+                sort_order, created_at, updated_at
+            )
+            SELECT ?, ti.group_name, ti.interface_type, ti.port_count,
+                   ti.sort_order, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+            FROM equipment e
+            JOIN equipment_type_interfaces ti ON ti.spec_key = e.spec_key
+            WHERE e.id = ?
+            ORDER BY ti.sort_order, ti.id
+            """,
+            (target_db_id, source_db_id),
+        )
+
+    @staticmethod
     def _to_interface_record(row: sqlite3.Row) -> EquipmentTypeInterfaceRecord:
         return EquipmentTypeInterfaceRecord(
             interface_id=int(row["id"]),
             spec_key=str(row["spec_key"]),
+            group_name=str(row["group_name"]),
+            interface_type=str(row["interface_type"]),
+            port_count=int(row["port_count"]),
+            sort_order=int(row["sort_order"]),
+        )
+
+    @staticmethod
+    def _to_equipment_interface_record(
+        row: sqlite3.Row,
+    ) -> EquipmentInterfaceRecord:
+        return EquipmentInterfaceRecord(
+            interface_id=int(row["id"]),
+            equipment_db_id=int(row["equipment_id"]),
             group_name=str(row["group_name"]),
             interface_type=str(row["interface_type"]),
             port_count=int(row["port_count"]),
